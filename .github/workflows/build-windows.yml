@@ -27,8 +27,9 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: ucrt64
-          # cmake/targets/common.cmake looks for npm-cli.js at C:/msys64
-          location: 'C:\'
+          # Use the runner's MSYS2 at C:\msys64, because
+          # cmake/targets/common.cmake looks for npm-cli.js at that path
+          release: false
           update: true
           install: >-
             wget
