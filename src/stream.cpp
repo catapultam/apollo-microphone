@@ -411,6 +411,7 @@ namespace stream {
       std::unique_ptr<platf::deinit_t> qos;
       bool enable_mic;
       bool first_mic_packet_logged;
+      bool first_mic_decrypt_error_logged;
     } audio;
 
     struct {
@@ -1407,9 +1408,14 @@ namespace stream {
 
       if (!session->audio.first_mic_packet_logged) {
         session->audio.first_mic_packet_logged = true;
-        BOOST_LOG(info) << "Received first client microphone packet for ["sv << session->device_name
-                        << "] from ["sv << peer.address().to_string() << ':' << peer.port()
-                        << "] with payload "sv << payload_len << " bytes";
+        // Warning level, so that the line is also in logs with min_log_level 3. Compare it
+        // with the client line "MIC: first packet".
+        BOOST_LOG(warning) << "Received first client microphone packet for ["sv << session->device_name
+                           << "] from ["sv << peer.address().to_string() << ':' << peer.port()
+                           << "] with payload "sv << payload_len << " bytes, first bytes "sv
+                           << util::hex_vec(payload, payload + std::min<std::size_t>(payload_len, 16), true)
+                           << ", encryptionFlagsEnabled "sv << util::log_hex(session->config.encryptionFlagsEnabled)
+                           << ", avRiKeyId "sv << session->audio.avRiKeyId;
       }
 
       std::vector<std::uint8_t> decrypted_payload;
@@ -1418,6 +1424,20 @@ namespace stream {
         *(std::uint32_t *) iv.data() = util::endian::big<std::uint32_t>(session->audio.avRiKeyId + sequence_number);
 
         if (session->audio.cipher.decrypt(std::string_view {reinterpret_cast<const char *>(payload), payload_len}, decrypted_payload, &iv) != 0) {
+          if (!session->audio.first_mic_decrypt_error_logged) {
+            // Print once what the client prints with MOONLIGHT_MIC_DEBUG=1, so the two logs can be compared
+            session->audio.first_mic_decrypt_error_logged = true;
+            const auto &key = session->audio.cipher.key;
+            const auto key_fingerprint = util::hex(crypto::hash(std::string_view {reinterpret_cast<const char *>(key.data()), key.size()}), true).to_string().substr(0, 8);
+            char openssl_error[256] = {};
+            ERR_error_string_n(ERR_peek_last_error(), openssl_error, sizeof(openssl_error));
+            BOOST_LOG(warning) << "Microphone decrypt diagnostics for ["sv << session->device_name
+                               << "]: avRiKeyId "sv << session->audio.avRiKeyId
+                               << ", sequence "sv << sequence_number
+                               << ", payload "sv << payload_len << " bytes"sv
+                               << ", key fingerprint "sv << key_fingerprint
+                               << ", OpenSSL error ["sv << openssl_error << ']';
+          }
           BOOST_LOG(warning) << "Dropping encrypted microphone packet with invalid payload for ["sv << session->device_name
                              << "] sequence "sv << sequence_number;
           audio::mic_debug_on_packet_decrypt_error(sequence_number, "Encrypted microphone packet could not be decrypted");
@@ -2379,6 +2399,7 @@ namespace stream {
       session->audio.timestamp = 0;
       session->audio.enable_mic = launch_session.enable_mic && config::audio.stream_mic;
       session->audio.first_mic_packet_logged = false;
+      session->audio.first_mic_decrypt_error_logged = false;
 
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);
