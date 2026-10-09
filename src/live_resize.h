@@ -111,9 +111,10 @@ namespace live_resize {
    *   the last add used (it can be a new GUID), so terminate() removes that monitor.
    *   The caller must call change_display_size() again with the old size. When that call
    *   also fails, the session has no display and the caller must stop the stream.
-   * @note Holds proc::vdd_lock during up to two removes and two adds. Each add can poll
-   * for the display name for about 640 ms, and each mode change takes up to about 300 ms.
-   * proc_t::terminate() waits for the lock during this time.
+   * @note Holds proc::vdd_lock during up to two removes, two adds and two mode changes.
+   * Each add can poll for the display name for about 1.26 s (sleeps of 20 to 640 ms), thus
+   * up to about 2.5 s for two adds. The mode changes call ChangeDisplaySettingsExW(), which
+   * has no time limit. proc_t::terminate() waits for the lock during this time.
    */
   display_result_t change_display_size(int width, int height);
 #endif
