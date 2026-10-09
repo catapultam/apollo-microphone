@@ -16,6 +16,12 @@ extern "C" {
   // clang-format off
 #include <moonlight-common-c/src/Limelight-internal.h>
 #include "rswrapper.h"
+
+// The upstream-based moonlight-common-c with the microphone stream does not
+// include an rs.h that defines this. 255 is the nanors value.
+#ifndef DATA_SHARDS_MAX
+  #define DATA_SHARDS_MAX 255
+#endif
   // clang-format on
 }
 
