@@ -82,7 +82,7 @@ namespace live_resize {
       // Always remove the old GUID. The add can succeed when the name poll times out.
       // When no monitor has this GUID, the remove only returns false.
       if (!VDISPLAY::removeVirtualDisplay(app.vdd.guid)) {
-        BOOST_LOG(warning) << "Live resize: could not remove the virtual display with the old GUID. A monitor can stay without an owner."sv;
+        BOOST_LOG(warning) << "Live resize: the remove of the old GUID failed. If a monitor with this GUID exists, it stays."sv;
       }
 
       auto new_uuid = uuid_util::uuid_t::generate();

@@ -228,9 +228,10 @@ namespace proc {
    * @brief Held while the virtual display is removed and added again, and while terminate() removes it.
    * @details A namespace mutex, because proc_t must stay movable (KITTY_DEFAULT_CONSTR_MOVE_THROW).
    * A live resize holds it for up to about 2.5 s of name polling (about 1.26 s for each of two
-   * adds) plus two mode changes, which have no time limit. terminate() waits for the lock
-   * during this time. Do not call proc_t::running() while you
-   * hold it: running() can call terminate(), which locks it again.
+   * adds) plus up to four mode changes (one or two after each add, two when
+   * isolated_virtual_display_option is set), which have no time limit. terminate() waits for
+   * the lock during this time. Do not call proc_t::running() while you hold it: running() can
+   * call terminate(), which locks it again.
    */
   extern std::mutex vdd_lock;
 #endif
