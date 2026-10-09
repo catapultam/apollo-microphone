@@ -79,14 +79,16 @@ namespace live_resize {
       // Spike S1: Windows kept the mode it saved for this monitor identity. Use a new identity.
       BOOST_LOG(warning) << "Live resize: display ["sv << platf::to_utf8(name) << "] is at "sv
                          << current_width << 'x' << current_height << ", adding it again with a new GUID"sv;
-      if (!name.empty()) {
-        VDISPLAY::removeVirtualDisplay(app.vdd.guid);
-      }
+      // Always remove the old GUID. The add can succeed when the name poll times out.
+      // When no monitor has this GUID, the remove only returns false.
+      VDISPLAY::removeVirtualDisplay(app.vdd.guid);
 
       auto new_uuid = uuid_util::uuid_t::generate();
       GUID new_guid;
       static_assert(sizeof(new_guid) == sizeof(new_uuid), "GUID and uuid_t have the same size");
       std::memcpy(&new_guid, &new_uuid, sizeof(new_guid));
+      // Record the new GUID before the add, so that terminate() removes the monitor
+      // also when the add gives no name in time
       app.set_vdd_guid(new_guid);
 
       name = add_and_apply(app.vdd, new_guid, width, height);

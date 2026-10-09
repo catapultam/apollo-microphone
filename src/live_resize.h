@@ -99,6 +99,21 @@ namespace live_resize {
    * @param height New height.
    * @return ok == false when no app with a virtual display runs or the display did not
    * reach the size. The caller reverts with the old size.
+   * @details Fields after each result:
+   * - ok == true: proc::proc.display_name and config::video.output_name name the new
+   *   monitor. The launch session size is the new size. proc::proc.vdd.guid is the GUID
+   *   of the monitor.
+   * - ok == false, "no app with a virtual display runs": no field changed. Do not revert.
+   * - ok == false, other message: the old monitor is removed. proc::proc.display_name and
+   *   config::video.output_name still name the old monitor, which can be missing now.
+   *   The capture thread cannot find a display until a change succeeds. The launch
+   *   session size is the old size. proc::proc.vdd.guid is the GUID of the monitor that
+   *   the last add used (it can be a new GUID), so terminate() removes that monitor.
+   *   The caller must call change_display_size() again with the old size. When that call
+   *   also fails, the session has no display and the caller must stop the stream.
+   * @note Holds proc::vdd_lock during up to two removes and two adds. Each add can poll
+   * for the display name for about 640 ms, and each mode change takes up to about 300 ms.
+   * proc_t::terminate() waits for the lock during this time.
    */
   display_result_t change_display_size(int width, int height);
 #endif

@@ -135,6 +135,7 @@ namespace proc {
 
     /**
      * @brief Store the new stream size in the launch session after a live resize.
+     * @details The caller holds proc::vdd_lock.
      */
     void set_vdd_size(int width, int height);
 #endif
@@ -225,6 +226,10 @@ namespace proc {
 #ifdef _WIN32
   /**
    * @brief Held while the virtual display is removed and added again, and while terminate() removes it.
+   * @details A namespace mutex, because proc_t must stay movable (KITTY_DEFAULT_CONSTR_MOVE_THROW).
+   * A live resize holds it for up to about 2 x 640 ms of name polling plus two mode changes.
+   * terminate() waits for the lock during this time. Do not call proc_t::running() while you
+   * hold it: running() can call terminate(), which locks it again.
    */
   extern std::mutex vdd_lock;
 #endif
