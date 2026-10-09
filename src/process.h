@@ -13,6 +13,7 @@
 #endif
 
 // standard includes
+#include <mutex>
 #include <optional>
 #include <unordered_map>
 
@@ -111,6 +112,33 @@ namespace proc {
     bool virtual_display = false;
     bool allow_client_commands = false;
 
+#ifdef _WIN32
+    /**
+     * @brief The virtual display of the running app, kept for live resize.
+     * @details execute() fills it and terminate() clears it, both under proc::vdd_lock.
+     */
+    struct vdd_t {
+      bool valid = false;
+      std::string device_uuid;
+      std::string device_name;
+      std::uint32_t target_fps = 0;
+      GUID guid {};
+    };
+
+    vdd_t vdd;
+
+    /**
+     * @brief Store a new GUID after live resize added the display with a new identity.
+     * @details The caller holds proc::vdd_lock. Also updates the launch session, which terminate() uses.
+     */
+    void set_vdd_guid(const GUID &guid);
+
+    /**
+     * @brief Store the new stream size in the launch session after a live resize.
+     */
+    void set_vdd_size(int width, int height);
+#endif
+
     proc_t(
       boost::process::v1::environment &&env,
       std::vector<ctx_t> &&apps
@@ -193,6 +221,13 @@ namespace proc {
   void terminate_process_group(boost::process::v1::child &proc, boost::process::v1::group &group, std::chrono::seconds exit_timeout);
 
   extern proc_t proc;
+
+#ifdef _WIN32
+  /**
+   * @brief Held while the virtual display is removed and added again, and while terminate() removes it.
+   */
+  extern std::mutex vdd_lock;
+#endif
 
   extern int input_only_app_id;
   extern std::string input_only_app_id_str;

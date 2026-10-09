@@ -61,6 +61,7 @@ namespace proc {
 
 #ifdef _WIN32
   VDISPLAY::DRIVER_STATUS vDisplayDriverStatus = VDISPLAY::DRIVER_STATUS::UNKNOWN;
+  std::mutex vdd_lock;
 
   void onVDisplayWatchdogFailed() {
     vDisplayDriverStatus = VDISPLAY::DRIVER_STATUS::WATCHDOG_FAILED;
@@ -286,6 +287,15 @@ namespace proc {
 
         if (config::video.double_refreshrate) {
           target_fps *= 2;
+        }
+
+        {
+          std::lock_guard lg(vdd_lock);
+          vdd.valid = true;
+          vdd.device_uuid = device_uuid_str;
+          vdd.device_name = device_name;
+          vdd.target_fps = target_fps;
+          vdd.guid = launch_session->display_guid;
         }
 
         std::wstring vdisplayName = VDISPLAY::createVirtualDisplay(
@@ -601,6 +611,22 @@ namespace proc {
     return 0;
   }
 
+#ifdef _WIN32
+  void proc_t::set_vdd_guid(const GUID &guid) {
+    vdd.guid = guid;
+    if (_launch_session) {
+      _launch_session->display_guid = guid;
+    }
+  }
+
+  void proc_t::set_vdd_size(int width, int height) {
+    if (_launch_session) {
+      _launch_session->width = width;
+      _launch_session->height = height;
+    }
+  }
+#endif
+
   void proc_t::resume() {
     BOOST_LOG(info) << "Session resuming for app [" << _app_name << "].";
 
@@ -757,13 +783,18 @@ namespace proc {
     }
 
     bool used_virtual_display = vDisplayDriverStatus == VDISPLAY::DRIVER_STATUS::OK && _launch_session && _launch_session->virtual_display;
-    if (used_virtual_display) {
-      if (VDISPLAY::removeVirtualDisplay(_launch_session->display_guid)) {
-        BOOST_LOG(info) << "Virtual Display removed successfully";
-      } else if (this->virtual_display) {
-        BOOST_LOG(warning) << "Virtual Display remove failed";
-      } else {
-        BOOST_LOG(warning) << "Virtual Display remove failed, but it seems it was not created correctly either.";
+    {
+      // Hold the lock so a live resize worker cannot add the display back after this remove
+      std::lock_guard lg(vdd_lock);
+      vdd = {};
+      if (used_virtual_display) {
+        if (VDISPLAY::removeVirtualDisplay(_launch_session->display_guid)) {
+          BOOST_LOG(info) << "Virtual Display removed successfully";
+        } else if (this->virtual_display) {
+          BOOST_LOG(warning) << "Virtual Display remove failed";
+        } else {
+          BOOST_LOG(warning) << "Virtual Display remove failed, but it seems it was not created correctly either.";
+        }
       }
     }
 
