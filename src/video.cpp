@@ -20,6 +20,7 @@ extern "C" {
 
 // local includes
 #include "process.h"
+#include "live_resize.h"
 #include "cbs.h"
 #include "config.h"
 #include "display_device.h"
@@ -1913,8 +1914,14 @@ namespace video {
   ) {
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
+      // capture_async reverts a live resize when this follows a size change
+      mail->event<bool>(mail::encoder_failed)->raise(true);
       return;
     }
+
+    // Live resize: tell the control thread that an encoder runs at config.width x config.height.
+    // The control thread ignores this when no resize is in progress.
+    mail->event<bool>(mail::resize_done)->raise(true);
 
     // As a workaround for NVENC hangs and to generally speed up encoder reinit,
     // we will complete the encoder teardown in a separate thread if supported.
@@ -2380,6 +2387,13 @@ namespace video {
     auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
     auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
 
+    // Live resize state (see src/live_resize.h)
+    auto resize_event = mail->event<std::pair<int, int>>(mail::resize);
+    auto encoder_failed_event = mail->event<bool>(mail::encoder_failed);
+    auto resize_refused_event = mail->event<std::uint16_t>(mail::resize_refused);
+    config_t last_good_config = config;
+    bool resize_pending = false;
+
     // Encoding takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
@@ -2398,6 +2412,16 @@ namespace video {
         }
 
         display = ref->display_wp->lock();
+      }
+
+      // A live resize changes the encoder size. The display change that goes with it
+      // caused the reinit that brought us here, so the display has the new size too.
+      if (auto size = resize_event->pop(0ms)) {
+        last_good_config = config;
+        config.width = size->first;
+        config.height = size->second;
+        resize_pending = true;
+        BOOST_LOG(info) << "Live resize: encoder size set to "sv << config.width << 'x' << config.height;
       }
 
       auto &encoder = *chosen_encoder;
@@ -2432,6 +2456,16 @@ namespace video {
         *ref->encoder_p,
         channel_data
       );
+
+      // Clear a stale failure flag, then check it only for a resize
+      bool encoder_failed = encoder_failed_event->pop(0ms);
+      if (resize_pending && encoder_failed) {
+        BOOST_LOG(warning) << "Live resize: encoder rejected "sv << config.width << 'x' << config.height
+                           << ", back to "sv << last_good_config.width << 'x' << last_good_config.height;
+        config = last_good_config;
+        resize_refused_event->raise((std::uint16_t) live_resize::reason_e::encoder_failed);
+      }
+      resize_pending = false;
     }
   }
 

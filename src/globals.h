@@ -55,6 +55,12 @@ namespace mail {
   MAIL(invalidate_ref_frames);
   MAIL(gamepad_feedback);
   MAIL(hdr);
+  // Live resize: new size for capture_async, refusal reason for the control thread,
+  // encoder session start, encoder session failure
+  MAIL(resize);
+  MAIL(resize_refused);
+  MAIL(resize_done);
+  MAIL(encoder_failed);
 #undef MAIL
 
 }  // namespace mail
