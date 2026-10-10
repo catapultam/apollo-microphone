@@ -68,14 +68,16 @@ Administrators or SYSTEM own them. If not, it stops (exit 1).
 
 Two tasks run the same script as SYSTEM:
 
-| Task | Start | Stream guard |
-| --- | --- | --- |
-| `ApolloUpdate` | daily at 04:00 | yes |
-| `ApolloUpdateNow` | only manual (`schtasks /run`) | no (`-SkipStreamGuard`) |
+| Task | Start | Stream guard | Release that failed before |
+| --- | --- | --- | --- |
+| `ApolloUpdate` | daily at 04:00 | yes | skip (exit 12) |
+| `ApolloUpdateNow` | only manual (`schtasks /run`) | no (`-SkipStreamGuard`) | try again (`-IgnoreFailedMarker`) |
 
 You get access to the host through a stream. Thus a manual update must not
 wait for the end of the stream. A manual start of `ApolloUpdateNow` means
-that you accept that the stream stops during the update.
+that you accept that the stream stops during the update. A failure can be
+temporary (for example, a network error). Thus `ApolloUpdateNow` tries
+again a release that failed before. The nightly task does not.
 
 `ApolloUpdate.ps1` does these steps:
 
@@ -98,7 +100,8 @@ that you accept that the stream stops during the update.
      rollback. `-Force` installs it again.
    - Installed commit equal to the manifest commit: write the state,
      exit 10.
-   - A `data\failed\<tag>` file exists: exit 12 (`-Force` tries again).
+   - A `data\failed\<tag>` file exists: exit 12. `-Force` or
+     `-IgnoreFailedMarker` (the `ApolloUpdateNow` task) tries again.
 5. Nightly task only: the stream guard (see below). Active: exit 11.
 6. Downloads `Apollo.exe` and verifies its SHA-256 against the signed
    manifest. If it is different, exit 6. Nothing has stopped yet. It keeps
@@ -162,7 +165,7 @@ nights. `ApolloUpdateNow` does not use the guard.
 | 0 | The new build is installed. |
 | 10 | Skipped: no newer release (up to date, or refused downgrade). |
 | 11 | Skipped: a stream is possibly active (nightly task). |
-| 12 | Skipped: this release failed before. |
+| 12 | Skipped: this release failed before (nightly task). |
 | 1 | Error before a change to the installation. |
 | 2 | Installation failed. The backup was restored. |
 | 3 | Installation failed and the restore failed. Restore manually. |
@@ -179,6 +182,7 @@ Parameters of `ApolloUpdate.ps1`:
 | `-Force` | Install again the last installed `run_id`, or a release that failed before. Never a lower `run_id`. |
 | `-CheckOnly` | Find and verify the release and do the checks. Downloads only the manifests. Does not stop or change Apollo. |
 | `-SkipStreamGuard` | Do not look for an active stream. |
+| `-IgnoreFailedMarker` | Try again a release that failed before (`data\failed\<tag>`). Does not change the `run_id` checks. |
 
 ## Install (one time, elevated)
 
@@ -204,10 +208,10 @@ The install script:
 - Makes `data\` with a protected ACL for SYSTEM and Administrators only.
 - Copies `ApolloUpdate.ps1` into it and compares the SHA-256.
 - Registers `\ApolloUpdate` (daily at 04:00) and `\ApolloUpdateNow` (no
-  trigger, `-SkipStreamGuard`). Both: user SYSTEM, run level Highest,
+  trigger, `-SkipStreamGuard -IgnoreFailedMarker`). Both: user SYSTEM, run level Highest,
   start on demand permitted, start after a missed start off, stop after
   60 minutes, no second instance. Action:
-  `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\ProgramData\ApolloUpdate\ApolloUpdate.ps1" -Channel <channel> [-SkipStreamGuard]`
+  `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\ProgramData\ApolloUpdate\ApolloUpdate.ps1" -Channel <channel> [-SkipStreamGuard -IgnoreFailedMarker]`
 - Sets the security descriptor of both tasks with the `Schedule.Service`
   COM object:
 
@@ -408,6 +412,10 @@ of these items were not tested on Windows.
    time). The log must show the restore, the service must run again with
    the old version, and `config\credentials` must have its old ACL
    (`icacls "C:\Program Files\Apollo\config\credentials"`).
+   `data\failed\<tag>` must exist. `ApolloUpdate.ps1 -CheckOnly` (without
+   `-IgnoreFailedMarker`, as the nightly task) gives exit 12. Then
+   `schtasks /run /tn ApolloUpdateNow` tries the release again (log:
+   `Try it again`).
 7. Second run: `schtasks /run /tn ApolloUpdateNow` again gives exit 10.
 8. Nightly guard: during a stream, run `schtasks /run /tn ApolloUpdate`.
    It must give exit 11. Without a stream, examine if it gives 11 anyway

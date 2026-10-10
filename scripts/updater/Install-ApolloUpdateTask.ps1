@@ -18,7 +18,9 @@
     3. Registers two tasks that run as SYSTEM with highest privileges:
        \ApolloUpdate     daily at 04:00, with the stream guard.
        \ApolloUpdateNow  no trigger, for a manual start, without the
-                         stream guard (-SkipStreamGuard).
+                         stream guard (-SkipStreamGuard). It tries again
+                         a release that failed before
+                         (-IgnoreFailedMarker).
        Both: start on demand permitted, no start after a missed start,
        stop after 60 minutes, no second instance.
     4. Sets the security descriptor of both tasks. Authenticated Users can
@@ -195,7 +197,7 @@ function Register-UpdateTask {
 $logPath = Join-Path $LogDir 'ApolloUpdate.log'
 Register-UpdateTask -Name 'ApolloUpdate' -ExtraArgs '' -Trigger (New-ScheduledTaskTrigger -Daily -At $At) `
     -Description "Nightly: installs the newest signed Apollo build (channel $Channel) if no stream is active. Log: $logPath"
-Register-UpdateTask -Name 'ApolloUpdateNow' -ExtraArgs '-SkipStreamGuard' -Trigger $null `
+Register-UpdateTask -Name 'ApolloUpdateNow' -ExtraArgs '-SkipStreamGuard -IgnoreFailedMarker' -Trigger $null `
     -Description "On demand: installs the newest signed Apollo build (channel $Channel) now. An active stream stops. Log: $logPath"
 
 Write-Host ''

@@ -5,7 +5,8 @@
 .DESCRIPTION
     This script runs as SYSTEM from the scheduled tasks "ApolloUpdate"
     (nightly, with the stream guard) and "ApolloUpdateNow" (on demand,
-    without the stream guard). Install-ApolloUpdateTask.ps1 installs it.
+    without the stream guard, and it tries again a release that failed
+    before). Install-ApolloUpdateTask.ps1 installs it.
 
     It reads the signed manifest of the newest releases of
     catapultam/apollo-microphone, verifies each RSA signature with the public
@@ -28,7 +29,8 @@
        0  The new build is installed.
       10  Skipped: no newer release (up to date).
       11  Skipped: a stream is possibly active (nightly guard).
-      12  Skipped: this release failed before (use -Force).
+      12  Skipped: this release failed before (use -Force or
+          -IgnoreFailedMarker).
        1  Error before a change to the installation.
        2  Installation failed. The backup was restored.
        3  Installation failed and the restore also failed.
@@ -54,6 +56,12 @@
 .PARAMETER SkipStreamGuard
     Do not look for an active Moonlight stream. The on-demand task uses
     this: a manual start means that the user accepts that the stream stops.
+
+.PARAMETER IgnoreFailedMarker
+    Try again a release that failed before (data\failed\<tag>). The
+    on-demand task uses this, so that a user can try again after a
+    temporary failure. The nightly task does not use it. It does not
+    change the run_id checks.
 #>
 [CmdletBinding()]
 param(
@@ -61,7 +69,8 @@ param(
     [string]$Channel = 'master',
     [switch]$Force,
     [switch]$CheckOnly,
-    [switch]$SkipStreamGuard
+    [switch]$SkipStreamGuard,
+    [switch]$IgnoreFailedMarker
 )
 
 Set-StrictMode -Version 2.0
@@ -788,7 +797,7 @@ function Invoke-Installer {
 # ---------------------------------------------------------------------------
 function Invoke-Update {
     $who = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    Write-Log "ApolloUpdate start. User: $who. Channel: $Channel. Force: $Force. CheckOnly: $CheckOnly. SkipStreamGuard: $SkipStreamGuard."
+    Write-Log "ApolloUpdate start. User: $who. Channel: $Channel. Force: $Force. CheckOnly: $CheckOnly. SkipStreamGuard: $SkipStreamGuard. IgnoreFailedMarker: $IgnoreFailedMarker."
 
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
 
@@ -837,9 +846,13 @@ function Invoke-Update {
     }
 
     $failedMarker = Join-Path $FailedDir $best.Tag
-    if ((Test-Path -LiteralPath $failedMarker) -and -not $Force) {
-        Write-Log "Release $($best.Tag) failed before ($failedMarker). Skip it. Use -Force to try again." 'WARN'
-        return 12
+    if (Test-Path -LiteralPath $failedMarker) {
+        if ($Force -or $IgnoreFailedMarker) {
+            Write-Log "Release $($best.Tag) failed before ($failedMarker). Try it again."
+        } else {
+            Write-Log "Release $($best.Tag) failed before ($failedMarker). Skip it. Use -Force or -IgnoreFailedMarker to try again." 'WARN'
+            return 12
+        }
     }
 
     if (-not $SkipStreamGuard) {
