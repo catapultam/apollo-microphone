@@ -4,10 +4,14 @@ permissions:
 
 # Builds the Windows installer and portable zip. Adapted from the
 # ci-windows.yml that commit da5a4e3e removed: build and package steps only.
+# The publish job signs the installer and puts it in a prerelease for
+# scripts/updater/ApolloUpdate.ps1. A manual run publishes for the branch
+# that it runs on.
 on:
   workflow_dispatch:
   push:
     branches:
+      - master
       - live-resize
 
 jobs:
@@ -21,6 +25,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          # Use a detached HEAD. Then cmake/prep/build_version.cmake adds the
+          # short commit sha to the version on all branches, also on master.
+          # The updater compares this sha with the release commit.
+          ref: ${{ github.sha }}
           submodules: recursive
 
       - name: Setup Dependencies Windows
@@ -91,3 +99,72 @@ jobs:
           name: build-Windows-AMD64
           path: artifacts/
           if-no-files-found: error
+
+  publish:
+    name: Publish signed release
+    needs: build_windows
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+       (github.ref_name == 'master' || github.ref_name == 'live-resize'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-Windows-AMD64
+          path: artifacts
+
+      - name: Sign SHA256SUMS
+        env:
+          SIGNING_KEY: ${{ secrets.APOLLO_UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY}" ]; then
+            echo "::error::The secret APOLLO_UPDATE_SIGNING_KEY is empty or missing."
+            exit 1
+          fi
+          mkdir -p release
+          cp artifacts/Apollo.exe release/Apollo.exe
+          cd release
+          sha256sum Apollo.exe > SHA256SUMS
+          cat SHA256SUMS
+          umask 077
+          key_file="${RUNNER_TEMP}/apollo-update-signing.pem"
+          printf '%s\n' "${SIGNING_KEY}" > "${key_file}"
+          trap 'shred -u "${key_file}" 2>/dev/null || rm -f "${key_file}"' EXIT
+          # Fail before the signature step if the key is not a valid key.
+          openssl pkey -in "${key_file}" -noout
+          # RSA with SHA-256 and PKCS#1 v1.5 padding over the exact file bytes.
+          openssl dgst -sha256 -sign "${key_file}" -out SHA256SUMS.sig SHA256SUMS
+          openssl pkey -in "${key_file}" -pubout -out "${RUNNER_TEMP}/pub.pem"
+          openssl dgst -sha256 -verify "${RUNNER_TEMP}/pub.pem" \
+            -signature SHA256SUMS.sig SHA256SUMS
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:7}"
+          tag="build-${RUN_NUMBER}-${short_sha}"
+          # ApolloUpdate.ps1 reads the "branch:" and "commit:" lines.
+          {
+            echo "branch: ${BRANCH}"
+            echo "commit: ${GITHUB_SHA}"
+            echo "run: ${RUN_ID}"
+            echo "run_url: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}"
+          } > release-notes.txt
+          gh release create "${tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --prerelease \
+            --title "Apollo ${BRANCH} build ${RUN_NUMBER} (${short_sha})" \
+            --notes-file release-notes.txt \
+            release/Apollo.exe release/SHA256SUMS release/SHA256SUMS.sig
+          echo "Created release ${tag}"
