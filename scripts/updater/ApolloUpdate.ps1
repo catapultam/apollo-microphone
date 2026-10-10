@@ -109,13 +109,17 @@ function Write-Log {
 }
 
 function Initialize-Log {
-    if (Test-Path -LiteralPath $LogFile) {
-        $size = (Get-Item -LiteralPath $LogFile -Force).Length
-        if ($size -ge $LogMaxBytes) {
-            $old = $LogFile + '.1'
-            if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Force }
-            Move-Item -LiteralPath $LogFile -Destination $old -Force
+    try {
+        if (Test-Path -LiteralPath $LogFile) {
+            $size = (Get-Item -LiteralPath $LogFile -Force).Length
+            if ($size -ge $LogMaxBytes) {
+                $old = $LogFile + '.1'
+                if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Force }
+                Move-Item -LiteralPath $LogFile -Destination $old -Force
+            }
         }
+    } catch {
+        Write-Host ('Cannot rotate the log file: ' + $_.Exception.Message)
     }
     $script:LogReady = $true
 }
@@ -612,11 +616,11 @@ function Invoke-Update {
             }
         }
 
-        Stop-Apollo
         try {
+            Stop-Apollo
             $backup = New-Backup
         } catch {
-            Write-Log ('Backup failed: ' + $_.Exception.Message + '. Start the service again. Nothing was installed.') 'ERROR'
+            Write-Log ('Stop or backup failed: ' + $_.Exception.Message + '. Start the service again. Nothing was installed.') 'ERROR'
             try { Start-Apollo } catch { Write-Log ('Cannot start the service: ' + $_.Exception.Message) 'ERROR' }
             return 1
         }
