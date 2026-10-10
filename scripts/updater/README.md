@@ -140,13 +140,25 @@ publish a fixed release, or (as administrator) disable the task.
     `install-service.bat` and `autostart-service.bat` from the restored
     files. Then start the service and do the health check (without the
     version). Exit 2. If the restore fails, exit 3.
-    An error on one file does not stop the restore. The updater writes the
-    file and the error to the log, sets the attributes of that file again
-    if the file exists, and continues with the next file. An error in the
-    config copy, the ACL restore or the scripts also does not stop it. The
-    updater always tries to start `ApolloService` and writes the result to
-    the log. If a file or the config copy failed, it then stops with exit 3
-    (no health check).
+    An error does not stop the restore before the service start:
+    - If the old uninstaller check or the service stop fails, the updater
+      logs the error and continues. If the stop fails, it runs
+      `taskkill /F /IM sunshine.exe` one time first.
+    - If the zip does not open, the updater logs the error and continues
+      without extraction.
+    - An error on one zip file: the updater writes the file and the error to
+      the log, sets the attributes of that file again if the file exists,
+      and continues with the next file.
+    - The config is copied back one file at a time. An error on one file
+      does not skip the other files.
+    - An `icacls /restore` error is logged and counted (a wrong ACL on the
+      credentials is a security problem).
+    - An error in the firewall or service scripts is only logged.
+
+    Then the updater always tries to start `ApolloService` and writes the
+    result to the log. If one of the counted errors occurred (uninstaller
+    check, service stop, zip, file, config file or `icacls`), it then
+    stops with exit 3 (no health check).
 
 Note about the installer: `cmake/packaging/windows_nsis.cmake` sets
 `CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON`. The CPack NSIS template of

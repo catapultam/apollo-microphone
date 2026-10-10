@@ -727,16 +727,34 @@ function Remove-OldBackups {
 function Restore-Backup {
     param($Backup, $Baseline)
     Write-Log "Restore the backup $($Backup.Zip) and $($Backup.Config)" 'WARN'
-    $deadline = (Get-Date).AddSeconds(120)
-    while ((Test-UninstallerRunning) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
-    Stop-Apollo
     # The host is reachable only through a stream. An error must not stop the
     # restore before the service starts. Count the errors, continue, and
     # throw after the service start.
     $failures = 0
-    $root = [System.IO.Path]::GetFullPath($InstallDir.TrimEnd('\') + '\')
+    try {
+        $deadline = (Get-Date).AddSeconds(120)
+        while ((Test-UninstallerRunning) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+    } catch {
+        $failures++
+        Write-Log ('Cannot check for the old uninstaller: ' + $_.Exception.Message) 'ERROR'
+    }
+    try {
+        Stop-Apollo
+    } catch {
+        $failures++
+        Write-Log ("Cannot stop ${ServiceName}: " + $_.Exception.Message) 'ERROR'
+        # Try one forced stop of sunshine.exe, then continue.
+        try {
+            $out = & taskkill.exe /F /IM sunshine.exe 2>&1
+            Write-Log "taskkill /F /IM sunshine.exe exit code: $LASTEXITCODE $out" 'WARN'
+        } catch {
+            Write-Log ('taskkill /F /IM sunshine.exe failed: ' + $_.Exception.Message) 'ERROR'
+        }
+    }
+    $root = $null
     $zip = $null
     try {
+        $root = [System.IO.Path]::GetFullPath($InstallDir.TrimEnd('\') + '\')
         $zip = [System.IO.Compression.ZipFile]::OpenRead($Backup.Zip)
     } catch {
         Write-Log ("Cannot open $($Backup.Zip): " + $_.Exception.Message) 'ERROR'
@@ -772,22 +790,45 @@ function Restore-Backup {
                     }
                 }
             }
+        } catch {
+            $failures++
+            Write-Log ("Cannot read $($Backup.Zip): " + $_.Exception.Message) 'ERROR'
         } finally {
             $zip.Dispose()
         }
     }
+    # Copy the config back one file at a time. An error on one file does not
+    # skip the other files.
+    $cfgFiles = @()
+    $bakRoot = $null
     try {
+        $bakRoot = $Backup.Config.TrimEnd('\') + '\'
         $null = New-Item -ItemType Directory -Path $ConfigDir -Force
-        Copy-Item -Path (Join-Path $Backup.Config '*') -Destination $ConfigDir -Recurse -Force
+        $cfgFiles = @(Get-ChildItem -LiteralPath $Backup.Config -Recurse -File -Force)
     } catch {
         $failures++
-        Write-Log ('Cannot copy the config back: ' + $_.Exception.Message) 'ERROR'
+        Write-Log ('Cannot read the config backup: ' + $_.Exception.Message) 'ERROR'
     }
-    # Put back the ACLs of the config folder (credentials).
+    foreach ($f in $cfgFiles) {
+        try {
+            $dest = Join-Path $ConfigDir $f.FullName.Substring($bakRoot.Length)
+            $null = New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force
+            Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
+        } catch {
+            $failures++
+            Write-Log ("Cannot copy the config file $($f.FullName) back: " + $_.Exception.Message) 'ERROR'
+        }
+    }
+    # Put back the ACLs of the config folder (credentials). A wrong ACL on
+    # the credentials is a security problem, thus a failure gives exit 3.
     try {
         $out = & icacls.exe $InstallDir /restore $Backup.Acl /C /Q 2>&1
-        if ($LASTEXITCODE -ne 0) { Write-Log "icacls /restore failed: $out" 'ERROR' }
+        if ($LASTEXITCODE -ne 0) {
+            $failures++
+            Write-Log "icacls /restore failed: $out" 'ERROR'
+        }
     } catch {
+        $failures++
         Write-Log ('icacls /restore failed: ' + $_.Exception.Message) 'ERROR'
     }
     # The old uninstaller removes the service and the firewall rules. Make
