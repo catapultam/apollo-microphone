@@ -730,45 +730,94 @@ function Restore-Backup {
     $deadline = (Get-Date).AddSeconds(120)
     while ((Test-UninstallerRunning) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
     Stop-Apollo
+    # The host is reachable only through a stream. An error must not stop the
+    # restore before the service starts. Count the errors, continue, and
+    # throw after the service start.
+    $failures = 0
     $root = [System.IO.Path]::GetFullPath($InstallDir.TrimEnd('\') + '\')
-    $zip = [System.IO.Compression.ZipFile]::OpenRead($Backup.Zip)
+    $zip = $null
     try {
-        foreach ($e in $zip.Entries) {
-            if (-not $e.Name) { continue }
-            $dest = [System.IO.Path]::GetFullPath((Join-Path $root $e.FullName.Replace('/', '\')))
-            if (-not $dest.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
-                throw "Zip entry is outside the install folder: $($e.FullName)"
-            }
-            $null = New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force
-            # ExtractToFile cannot replace a hidden or read-only file (access
-            # denied). Apollo has hidden files in config\credentials. Remove
-            # the attributes, extract, then set them again.
-            $attr = $null
-            if ([System.IO.File]::Exists($dest)) {
-                $attr = [System.IO.File]::GetAttributes($dest)
-                [System.IO.File]::SetAttributes($dest, [System.IO.FileAttributes]::Normal)
-            }
-            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $dest, $true)
-            if ($null -ne $attr) { [System.IO.File]::SetAttributes($dest, $attr) }
-        }
-    } finally {
-        $zip.Dispose()
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($Backup.Zip)
+    } catch {
+        Write-Log ("Cannot open $($Backup.Zip): " + $_.Exception.Message) 'ERROR'
+        $failures++
     }
-    $null = New-Item -ItemType Directory -Path $ConfigDir -Force
-    Copy-Item -Path (Join-Path $Backup.Config '*') -Destination $ConfigDir -Recurse -Force
+    if ($zip) {
+        try {
+            foreach ($e in $zip.Entries) {
+                if (-not $e.Name) { continue }
+                $dest = $null
+                $attr = $null
+                try {
+                    $dest = [System.IO.Path]::GetFullPath((Join-Path $root $e.FullName.Replace('/', '\')))
+                    if (-not $dest.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        throw "Zip entry is outside the install folder: $($e.FullName)"
+                    }
+                    $null = New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force
+                    # ExtractToFile cannot replace a hidden or read-only file
+                    # (access denied). Apollo has hidden files in
+                    # config\credentials. Remove the attributes, extract, then
+                    # set them again.
+                    if ([System.IO.File]::Exists($dest)) {
+                        $attr = [System.IO.File]::GetAttributes($dest)
+                        [System.IO.File]::SetAttributes($dest, [System.IO.FileAttributes]::Normal)
+                    }
+                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $dest, $true)
+                    if ($null -ne $attr) { [System.IO.File]::SetAttributes($dest, $attr) }
+                } catch {
+                    $failures++
+                    Write-Log ("Cannot restore $($e.FullName): " + $_.Exception.Message) 'ERROR'
+                    if ($null -ne $attr -and [System.IO.File]::Exists($dest)) {
+                        try { [System.IO.File]::SetAttributes($dest, $attr) } catch { Write-Log ("Cannot set the attributes of ${dest}: " + $_.Exception.Message) 'ERROR' }
+                    }
+                }
+            }
+        } finally {
+            $zip.Dispose()
+        }
+    }
+    try {
+        $null = New-Item -ItemType Directory -Path $ConfigDir -Force
+        Copy-Item -Path (Join-Path $Backup.Config '*') -Destination $ConfigDir -Recurse -Force
+    } catch {
+        $failures++
+        Write-Log ('Cannot copy the config back: ' + $_.Exception.Message) 'ERROR'
+    }
     # Put back the ACLs of the config folder (credentials).
-    $out = & icacls.exe $InstallDir /restore $Backup.Acl /C /Q 2>&1
-    if ($LASTEXITCODE -ne 0) { Write-Log "icacls /restore failed: $out" 'ERROR' }
+    try {
+        $out = & icacls.exe $InstallDir /restore $Backup.Acl /C /Q 2>&1
+        if ($LASTEXITCODE -ne 0) { Write-Log "icacls /restore failed: $out" 'ERROR' }
+    } catch {
+        Write-Log ('icacls /restore failed: ' + $_.Exception.Message) 'ERROR'
+    }
     # The old uninstaller removes the service and the firewall rules. Make
     # them again with the restored scripts.
-    Invoke-ApolloScript -Name 'delete-firewall-rule.bat'
-    Invoke-ApolloScript -Name 'add-firewall-rule.bat'
-    if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
-        Write-Log "$ServiceName does not exist. Install it again." 'WARN'
-        Invoke-ApolloScript -Name 'install-service.bat'
-        Invoke-ApolloScript -Name 'autostart-service.bat'
+    try {
+        Invoke-ApolloScript -Name 'delete-firewall-rule.bat'
+        Invoke-ApolloScript -Name 'add-firewall-rule.bat'
+    } catch {
+        Write-Log ('Firewall scripts failed: ' + $_.Exception.Message) 'ERROR'
     }
-    Start-Apollo
+    try {
+        if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
+            Write-Log "$ServiceName does not exist. Install it again." 'WARN'
+            Invoke-ApolloScript -Name 'install-service.bat'
+            Invoke-ApolloScript -Name 'autostart-service.bat'
+        }
+    } catch {
+        Write-Log ('Service scripts failed: ' + $_.Exception.Message) 'ERROR'
+    }
+    # Always try to start the service, also after errors.
+    try {
+        Start-Apollo
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($svc) { Write-Log "$ServiceName status after start: $($svc.Status)" 'WARN' }
+    } catch {
+        Write-Log ("Cannot start ${ServiceName}: " + $_.Exception.Message) 'ERROR'
+    }
+    if ($failures -gt 0) {
+        throw "The restore had $failures errors. See the log."
+    }
     if (-not (Wait-Healthy -FullSha $null -Baseline $Baseline)) {
         throw "The restored installation is not healthy. Version $(Get-InstalledVersion)."
     }

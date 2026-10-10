@@ -79,6 +79,12 @@ that you accept that the stream stops during the update. A failure can be
 temporary (for example, a network error). Thus `ApolloUpdateNow` tries
 again a release that failed before. The nightly task does not.
 
+Each user that can start `ApolloUpdateNow` (all Authenticated Users) can
+start it again and again for a bad release. Each run stops the service,
+installs, fails the health check, and restores the backup. Thus each run
+stops the stream for some minutes. This is by design. To stop the retries,
+publish a fixed release, or (as administrator) disable the task.
+
 `ApolloUpdate.ps1` does these steps:
 
 1. Takes the lock file. If a different run has it, exit 4.
@@ -134,6 +140,13 @@ again a release that failed before. The nightly task does not.
     `install-service.bat` and `autostart-service.bat` from the restored
     files. Then start the service and do the health check (without the
     version). Exit 2. If the restore fails, exit 3.
+    An error on one file does not stop the restore. The updater writes the
+    file and the error to the log, sets the attributes of that file again
+    if the file exists, and continues with the next file. An error in the
+    config copy, the ACL restore or the scripts also does not stop it. The
+    updater always tries to start `ApolloService` and writes the result to
+    the log. If a file or the config copy failed, it then stops with exit 3
+    (no health check).
 
 Note about the installer: `cmake/packaging/windows_nsis.cmake` sets
 `CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON`. The CPack NSIS template of
