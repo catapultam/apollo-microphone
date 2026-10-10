@@ -190,7 +190,7 @@ its commit is not the installed commit.
 
 ## Change the signing key (re-key)
 
-Do this if the private key is possibly known to an other person, or to
+Do this if the private key is possibly known to a different person, or to
 replace it. Do it on a Linux computer with `openssl`, `python3` and `gh`.
 
 1. Make a new key pair in memory (not on a disk):
@@ -230,7 +230,7 @@ replace it. Do it on a Linux computer with `openssl`, `python3` and `gh`.
    the new `ApolloUpdate.ps1`. Until you do this, the host does not accept
    releases with the new key. Releases signed with the old key stay valid
    for a host with the old script. Delete them on GitHub if the old key is
-   possibly known to an other person.
+   possibly known to a different person.
 
 ## Security model
 
@@ -248,9 +248,9 @@ The task runs downloaded code as SYSTEM. These items protect it:
   to the repository is equal to the right to sign.
 - The release body (`branch:` and `commit:`) is not signed. A person with
   write access to the repository can make a release that points a channel
-  to an older signed build, or to a signed build of an other branch. The
+  to an older signed build, or to a signed build of a different branch. The
   signature stops unsigned code, but it does not stop a downgrade or a
-  build from an other branch. The check after the installation uses the
+  build from a different branch. The check after the installation uses the
   same unsigned commit value.
 - `C:\ProgramData\ApolloUpdate` is owned by Administrators. Users can only
   read and execute. Thus a normal user cannot change the script that SYSTEM

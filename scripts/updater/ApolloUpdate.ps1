@@ -253,7 +253,11 @@ function Get-OpenFileLength {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return -1 }
     $share = [System.IO.FileShare]'ReadWrite, Delete'
-    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+    } catch {
+        return -1
+    }
     try { return $fs.Length } finally { $fs.Dispose() }
 }
 
@@ -323,7 +327,13 @@ function Test-ReleaseSignature {
         $p.Exponent = [Convert]::FromBase64String($PublicKeyExponentBase64)
         if ($p.Modulus.Length -ne 384) { throw 'The embedded public key is not RSA 3072.' }
         if ($Signature.Length -ne 384) { throw "The signature has $($Signature.Length) bytes, not 384." }
-        $rsa = [System.Security.Cryptography.RSA]::Create()
+        # On .NET Framework, use RSACng: RSACryptoServiceProvider can refuse
+        # SHA-256 with some CSP types.
+        if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            $rsa = New-Object System.Security.Cryptography.RSACng
+        } else {
+            $rsa = [System.Security.Cryptography.RSA]::Create()
+        }
         try {
             $rsa.ImportParameters($p)
             return [bool]$rsa.VerifyData($Data, $Signature,
@@ -672,7 +682,7 @@ try {
         $haveMutex = $true
     }
     if (-not $haveMutex) {
-        Write-Log 'An other ApolloUpdate run is active. Stop.' 'WARN'
+        Write-Log 'A different ApolloUpdate run is active. Stop.' 'WARN'
         $exitCode = 0
     } else {
         $exitCode = [int](Invoke-Update | Select-Object -Last 1)
