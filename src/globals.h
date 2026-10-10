@@ -61,8 +61,9 @@ namespace mail {
   MAIL(resize_refused);
   MAIL(resize_done);
   MAIL(encoder_failed);
-  // Adaptive bitrate: change for the encode thread (event, newest wins),
-  // results for the control thread (queue, no result is lost)
+  // Adaptive bitrate: change for the encode thread (event; a newer change replaces an
+  // older one, which then gets no result), results for the control thread (queue; it
+  // clears when it holds 32 items)
   MAIL(bitrate);
   MAIL(bitrate_result);
 #undef MAIL

@@ -2035,7 +2035,12 @@ namespace video {
 
       // Adaptive bitrate: change the running encoder, else restart it at the new bitrate
       if (auto change = bitrate_events->pop(0ms)) {
-        if (change->encoder_kbps == config.bitrate) {
+        if (change->encoder_kbps <= 0) {
+          // Do not start an encoder at 0 kbps; keep the bitrate that runs now
+          BOOST_LOG(warning) << "Bitrate request "sv << change->request_id << ": encoder bitrate "sv << change->encoder_kbps
+                             << " kbps is not valid, keep "sv << config.bitrate << " kbps"sv;
+          bitrate_results->raise(adaptive_bitrate::result_t {*change, adaptive_bitrate::status_e::unchanged});
+        } else if (change->encoder_kbps == config.bitrate) {
           bitrate_results->raise(adaptive_bitrate::result_t {*change, adaptive_bitrate::status_e::unchanged});
         } else if (session->set_bitrate(change->encoder_kbps)) {
           BOOST_LOG(info) << "Bitrate request "sv << change->request_id << ": "sv << change->accepted_kbps
@@ -2432,7 +2437,7 @@ namespace video {
     // Adaptive bitrate state (see src/adaptive_bitrate.h)
     auto bitrate_event = mail->event<adaptive_bitrate::change_t>(mail::bitrate);
     auto bitrate_results = mail->queue<adaptive_bitrate::result_t>(mail::bitrate_result);
-    std::optional<adaptive_bitrate::change_t> bitrate_restart;  // set by encode_run
+    std::optional<adaptive_bitrate::change_t> bitrate_restart;  // set by encode_run (restart) or by the mail pop below
     std::optional<adaptive_bitrate::change_t> bitrate_applying;  // the change of the next encoder start
     int previous_bitrate = config.bitrate;
 
@@ -2482,6 +2487,7 @@ namespace video {
 
       auto encode_device = make_encode_device(*display, encoder, config);
       if (!encode_device) {
+        // Known limit: a bitrate change in progress gets no result; the session stops
         return;
       }
 

@@ -26,7 +26,8 @@
 
 namespace {
   // Spike S1 (adaptive bitrate plan, Task 2): true when NvEncReconfigureEncoder() can also
-  // change vbvBufferSize. Outcome B sets it to false.
+  // change vbvBufferSize. The test on RTX 5070 and RTX 4090 passed (outcome A).
+  // Outcome B sets it to false.
   constexpr bool RECONFIGURE_VBV = true;
 }  // namespace
 
@@ -563,9 +564,11 @@ namespace nvenc {
     };
 
     if (encoder_state.bitrate_changed) {
-      // Spike S1 on the real path: an in-place bitrate change must not make an IDR frame
+      // Spike S1 on the real path: an in-place bitrate change must not make an IDR frame.
+      // The first frame of a new encoder is always an IDR frame; create_encoder() sets
+      // last_encoded_frame_index to 0, thus that frame does not cause the warning.
       encoder_state.bitrate_changed = false;
-      if (lock_bitstream.pictureType == NV_ENC_PIC_TYPE_IDR && !force_idr) {
+      if (lock_bitstream.pictureType == NV_ENC_PIC_TYPE_IDR && !force_idr && encoder_state.last_encoded_frame_index != 0) {
         BOOST_LOG(warning) << "NvEnc: the first frame after a bitrate change is an IDR frame";
       }
     }
