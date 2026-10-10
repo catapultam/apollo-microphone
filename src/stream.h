@@ -56,8 +56,9 @@ namespace stream {
     void stop(session_t &session);
     void graceful_stop(session_t& session);
 
-    // Number of sessions in state RUNNING, counted in start() and stop()
-    extern std::atomic_uint running_sessions;
+    // Number of sessions in state RUNNING. start() increments it, and stop() and
+    // graceful_stop() decrement it at the change from RUNNING to STOPPING.
+    extern std::atomic_uint active_sessions;
     void join(session_t &session);
     state_e state(session_t &session);
     inline bool send(session_t& session, const std::string_view &payload);

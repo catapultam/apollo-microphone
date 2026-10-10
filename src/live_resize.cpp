@@ -34,17 +34,23 @@ namespace live_resize {
     return true;
   }
 
+  // True when terminate() started or another app owns the display now
+  static bool display_lost(std::uint32_t generation) {
+    return proc::vdd_generation.load() != generation;
+  }
+
   // Adds the monitor with this GUID at the size and applies the mode, as proc_t::execute() does.
   // Returns the device name, or an empty string when the driver gave no name in time.
-  static std::wstring add_and_apply(const proc::proc_t::vdd_t &vdd, const GUID &guid, int width, int height) {
+  // Skips the mode changes when terminate() started.
+  static std::wstring add_and_apply(const proc::proc_t::vdd_t &vdd, const GUID &guid, int width, int height, std::uint32_t generation) {
     auto name = VDISPLAY::createVirtualDisplay(vdd.device_uuid.c_str(), vdd.device_name.c_str(), width, height, vdd.target_fps, guid);
-    if (name.empty()) {
+    if (name.empty() || display_lost(generation)) {
       return name;
     }
 
     // Spike S1b: after a re-add Windows first shows the saved mode; this call applies the new one
     VDISPLAY::changeDisplaySettings(name.c_str(), width, height, vdd.target_fps);
-    if (config::video.isolated_virtual_display_option) {
+    if (config::video.isolated_virtual_display_option && !display_lost(generation)) {
       VDISPLAY::changeDisplaySettings2(name.c_str(), width, height, vdd.target_fps, true);
     }
     return name;
@@ -56,14 +62,14 @@ namespace live_resize {
     return !name.empty() && read_mode(name, current_width, current_height) && current_width == width && current_height == height;
   }
 
-  display_result_t change_display_size(int width, int height) {
+  display_result_t change_display_size(int width, int height, std::uint32_t generation) {
     auto &app = proc::proc;
     std::lock_guard lg(proc::vdd_lock);
 
     // Do not call app.running() here: it can call terminate(), which locks proc::vdd_lock.
     // terminate() clears vdd under the lock, thus vdd.valid is false after the app stops.
-    if (!app.vdd.valid || !app.virtual_display) {
-      return {false, "no app with a virtual display runs"};
+    if (!app.vdd.valid || !app.virtual_display || generation == 0 || display_lost(generation)) {
+      return {false, false, "no app with this virtual display runs"};
     }
 
     // A failed remove is not fatal: the add below returns the existing monitor for a known GUID
@@ -72,7 +78,10 @@ namespace live_resize {
     }
 
     int current_width, current_height;
-    auto name = add_and_apply(app.vdd, app.vdd.guid, width, height);
+    auto name = add_and_apply(app.vdd, app.vdd.guid, width, height, generation);
+    if (display_lost(generation)) {
+      return {false, true, "the app stops"};
+    }
     bool at_size = is_at_size(name, width, height, current_width, current_height);
 
     if (!at_size) {
@@ -93,12 +102,15 @@ namespace live_resize {
       // also when the add gives no name in time
       app.set_vdd_guid(new_guid);
 
-      name = add_and_apply(app.vdd, new_guid, width, height);
+      name = add_and_apply(app.vdd, new_guid, width, height, generation);
+      if (display_lost(generation)) {
+        return {false, true, "the app stops"};
+      }
       at_size = is_at_size(name, width, height, current_width, current_height);
     }
 
     if (!at_size) {
-      return {false, "display is at " + std::to_string(current_width) + "x" + std::to_string(current_height) + " instead of " + std::to_string(width) + "x" + std::to_string(height)};
+      return {false, true, "display is at " + std::to_string(current_width) + "x" + std::to_string(current_height) + " instead of " + std::to_string(width) + "x" + std::to_string(height)};
     }
 
     // The capture thread finds the display by this name at its next reinit
@@ -107,7 +119,7 @@ namespace live_resize {
     app.set_vdd_size(width, height);
 
     BOOST_LOG(info) << "Live resize: display ["sv << app.display_name << "] is now "sv << width << 'x' << height;
-    return {true, {}};
+    return {true, true, {}};
   }
 
 }  // namespace live_resize

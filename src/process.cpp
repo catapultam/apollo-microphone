@@ -62,6 +62,7 @@ namespace proc {
 #ifdef _WIN32
   VDISPLAY::DRIVER_STATUS vDisplayDriverStatus = VDISPLAY::DRIVER_STATUS::UNKNOWN;
   std::mutex vdd_lock;
+  std::atomic<std::uint32_t> vdd_generation {0};
 
   void onVDisplayWatchdogFailed() {
     vDisplayDriverStatus = VDISPLAY::DRIVER_STATUS::WATCHDOG_FAILED;
@@ -296,6 +297,13 @@ namespace proc {
           vdd.device_name = device_name;
           vdd.target_fps = target_fps;
           vdd.guid = launch_session->display_guid;
+
+          // A new identity for this display. Never 0, which means "no display".
+          static std::uint32_t last_generation = 0;
+          if (++last_generation == 0) {
+            ++last_generation;
+          }
+          vdd_generation = last_generation;
         }
 
         std::wstring vdisplayName = VDISPLAY::createVirtualDisplay(
@@ -784,8 +792,12 @@ namespace proc {
 
     bool used_virtual_display = vDisplayDriverStatus == VDISPLAY::DRIVER_STATUS::OK && _launch_session && _launch_session->virtual_display;
     {
+      // Tell a live resize that holds the lock to stop after its current step
+      vdd_generation = 0;
+
       // Hold the lock so a live resize worker cannot add the display back after this remove
       std::lock_guard lg(vdd_lock);
+      vdd_generation = 0;
       vdd = {};
       if (used_virtual_display) {
         if (VDISPLAY::removeVirtualDisplay(_launch_session->display_guid)) {

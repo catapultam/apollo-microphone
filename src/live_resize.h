@@ -86,6 +86,7 @@ namespace live_resize {
    */
   struct display_result_t {
     bool ok;
+    bool changed;  ///< False when the function changed nothing. Do not revert then.
     std::string message;  ///< Reason of the failure, empty on success
   };
 
@@ -97,27 +98,36 @@ namespace live_resize {
    * config::video.output_name and the launch session size on success.
    * @param width New width.
    * @param height New height.
-   * @return ok == false when no app with a virtual display runs or the display did not
-   * reach the size. The caller reverts with the old size.
+   * @param generation The value of proc::vdd_generation at the request. The function
+   * changes the display only while proc::vdd_generation has this value, thus not the
+   * display of another app. It stops after the current step when terminate() starts.
+   * @return ok == false when no app with this virtual display runs, when terminate()
+   * started, or when the display did not reach the size.
    * @details Fields after each result:
    * - ok == true: proc::proc.display_name and config::video.output_name name the new
    *   monitor. The launch session size is the new size. proc::proc.vdd.guid is the GUID
-   *   of the monitor.
-   * - ok == false, "no app with a virtual display runs": no field changed. Do not revert.
-   * - ok == false, other message: the old monitor is removed. proc::proc.display_name and
+   *   of the monitor. changed == true.
+   * - ok == false, changed == false: no app with this virtual display runs. No field
+   *   changed. Do not revert.
+   * - ok == false, changed == true: the old monitor is removed. proc::proc.display_name and
    *   config::video.output_name still name the old monitor, which can be missing now.
    *   The capture thread cannot find a display until a change succeeds. The launch
    *   session size is the old size. proc::proc.vdd.guid is the GUID of the monitor that
    *   the last add used (it can be a new GUID), so terminate() removes that monitor.
    *   The caller must call change_display_size() again with the old size. When that call
-   *   also fails, the session has no display and the caller must stop the stream.
+   *   also fails with changed == true, the session has no display and the caller must
+   *   stop the stream.
    * @note Holds proc::vdd_lock during up to two removes, two adds and four mode changes.
    * Each add can poll for the display name for about 1.26 s (sleeps of 20 to 640 ms), thus
    * up to about 2.5 s for two adds. After each add there are one or two mode changes (two
    * when config::video.isolated_virtual_display_option is set), thus up to four. The mode
-   * changes have no time limit. proc_t::terminate() waits for the lock during this time.
+   * changes have no time limit. proc_t::terminate() sets proc::vdd_generation to 0 before
+   * it waits for the lock. This function checks the value after each add and each mode
+   * change and stops, thus terminate() waits for one add (about 1.26 s) or one mode change.
+   * A mode change that does not return still blocks terminate(). stream::session::join()
+   * can call terminate() inside its 10 s hang check, which then ends Apollo.
    */
-  display_result_t change_display_size(int width, int height);
+  display_result_t change_display_size(int width, int height, std::uint32_t generation);
 #endif
 
 }  // namespace live_resize
