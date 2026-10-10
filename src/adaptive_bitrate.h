@@ -43,7 +43,7 @@ namespace adaptive_bitrate {
     unchanged = 2,  ///< The encoder already runs at this value
     not_supported = 3,  ///< The encoder path cannot change the bitrate (sync capture path)
     invalid = 4,  ///< The configured bitrate is out of limits
-    encoder_failed = 5,  ///< The restart failed. The encoder runs at the old bitrate.
+    encoder_failed = 5,  ///< The restart failed, or the value was 0 kbps or less. The encoder runs at the old bitrate.
     input_only = 6,  ///< The session has no video
   };
 
