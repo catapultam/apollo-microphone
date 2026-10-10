@@ -1909,6 +1909,20 @@ namespace video {
     return nullptr;
   }
 
+  /**
+   * @brief Check the encoder bitrate of an adaptive bitrate change.
+   * @details The caller makes no new encoder for a refused change and raises result encoder_failed.
+   * @return True when encoder_kbps is 0 or less. The function then writes a warning log.
+   */
+  static bool bitrate_change_refused(const adaptive_bitrate::change_t &change, int running_kbps) {
+    if (change.encoder_kbps > 0) {
+      return false;
+    }
+    BOOST_LOG(warning) << "Bitrate request "sv << change.request_id << ": encoder bitrate "sv << change.encoder_kbps
+                       << " kbps is not valid, keep "sv << running_kbps << " kbps"sv;
+    return true;
+  }
+
   void encode_run(
     int &frame_nr,  // Store progress of the frame number
     safe::mail_t mail,
@@ -2035,11 +2049,8 @@ namespace video {
 
       // Adaptive bitrate: change the running encoder, else restart it at the new bitrate
       if (auto change = bitrate_events->pop(0ms)) {
-        if (change->encoder_kbps <= 0) {
-          // Do not start an encoder at 0 kbps; keep the bitrate that runs now
-          BOOST_LOG(warning) << "Bitrate request "sv << change->request_id << ": encoder bitrate "sv << change->encoder_kbps
-                             << " kbps is not valid, keep "sv << config.bitrate << " kbps"sv;
-          bitrate_results->raise(adaptive_bitrate::result_t {*change, adaptive_bitrate::status_e::unchanged});
+        if (bitrate_change_refused(*change, config.bitrate)) {
+          bitrate_results->raise(adaptive_bitrate::result_t {*change, adaptive_bitrate::status_e::encoder_failed});
         } else if (change->encoder_kbps == config.bitrate) {
           bitrate_results->raise(adaptive_bitrate::result_t {*change, adaptive_bitrate::status_e::unchanged});
         } else if (session->set_bitrate(change->encoder_kbps)) {
@@ -2475,6 +2486,10 @@ namespace video {
       // A change in the mail is newer than the restart request, thus it wins.
       if (auto change = bitrate_event->pop(0ms)) {
         bitrate_restart = *change;
+      }
+      if (bitrate_restart && bitrate_change_refused(*bitrate_restart, config.bitrate)) {
+        bitrate_results->raise(adaptive_bitrate::result_t {*bitrate_restart, adaptive_bitrate::status_e::encoder_failed});
+        bitrate_restart.reset();
       }
       if (bitrate_restart) {
         previous_bitrate = config.bitrate;
