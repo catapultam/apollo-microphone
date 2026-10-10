@@ -25,6 +25,12 @@
 #endif
 
 namespace {
+  // Spike S1 (adaptive bitrate plan, Task 2): true when NvEncReconfigureEncoder() can also
+  // change vbvBufferSize. Outcome B sets it to false.
+  constexpr bool RECONFIGURE_VBV = true;
+}  // namespace
+
+namespace {
 
   GUID quality_preset_guid_from_number(unsigned number) {
     if (number > 7) {
@@ -247,11 +253,11 @@ namespace nvenc {
     enc_config.rcParams.enableAQ = config.adaptive_quantization;
     enc_config.rcParams.averageBitRate = client_config.bitrate * 1000;
 
-    if (get_encoder_cap(NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE)) {
-      enc_config.rcParams.vbvBufferSize = client_config.bitrate * 1000 / client_config.framerate;
-      if (config.vbv_percentage_increase > 0) {
-        enc_config.rcParams.vbvBufferSize += enc_config.rcParams.vbvBufferSize * config.vbv_percentage_increase / 100;
-      }
+    saved_framerate = client_config.framerate;
+    saved_vbv_percentage_increase = config.vbv_percentage_increase;
+    custom_vbv = get_encoder_cap(NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE);
+    if (custom_vbv) {
+      enc_config.rcParams.vbvBufferSize = vbv_size(client_config.bitrate);
     }
 
     auto set_h264_hevc_common_format_config = [&](auto &format_config) {
@@ -381,7 +387,12 @@ namespace nvenc {
 
     init_params.encodeConfig = &enc_config;
 
-    if (nvenc_failed(nvenc->nvEncInitializeEncoder(encoder, &init_params))) {
+    // Keep the parameters for reconfigure_bitrate()
+    saved_enc_config = enc_config;
+    saved_init_params = init_params;
+    saved_init_params.encodeConfig = &saved_enc_config;
+
+    if (nvenc_failed(nvenc->nvEncInitializeEncoder(encoder, &saved_init_params))) {
       BOOST_LOG(error) << "NvEnc: NvEncInitializeEncoder() failed: " << last_nvenc_error_string;
       return false;
     }
@@ -551,6 +562,14 @@ namespace nvenc {
       encoder_state.rfi_needs_confirmation,
     };
 
+    if (encoder_state.bitrate_changed) {
+      // Spike S1 on the real path: an in-place bitrate change must not make an IDR frame
+      encoder_state.bitrate_changed = false;
+      if (lock_bitstream.pictureType == NV_ENC_PIC_TYPE_IDR && !force_idr) {
+        BOOST_LOG(warning) << "NvEnc: the first frame after a bitrate change is an IDR frame";
+      }
+    }
+
     if (encoder_state.rfi_needs_confirmation) {
       // Invalidation request has been fulfilled, and video network packet will be marked as such
       encoder_state.rfi_needs_confirmation = false;
@@ -661,6 +680,47 @@ namespace nvenc {
     }
 
     return false;
+  }
+
+  uint32_t nvenc_base::vbv_size(uint32_t kbps) const {
+    // The formula of create_encoder(): one frame at the bitrate, plus the VBV increase
+    uint32_t size = kbps * 1000 / saved_framerate;
+    if (saved_vbv_percentage_increase > 0) {
+      size += size * saved_vbv_percentage_increase / 100;
+    }
+    return size;
+  }
+
+  bool nvenc_base::reconfigure_bitrate(uint32_t kbps) {
+    if (!encoder || kbps == 0) {
+      return false;
+    }
+
+    NV_ENC_CONFIG new_config = saved_enc_config;
+    const uint32_t old_kbps = new_config.rcParams.averageBitRate / 1000;
+    const uint32_t old_vbv = new_config.rcParams.vbvBufferSize;
+    new_config.rcParams.averageBitRate = kbps * 1000;
+    if (custom_vbv && RECONFIGURE_VBV) {
+      new_config.rcParams.vbvBufferSize = vbv_size(kbps);
+    }
+
+    // maxBitRate is for VBR only; the encoder uses CBR. No new IDR frame and no reset of the
+    // rate control: enablePTD = 1 keeps the next frame a P frame.
+    NV_ENC_RECONFIGURE_PARAMS params = {min_struct_version(NV_ENC_RECONFIGURE_PARAMS_VER)};
+    params.reInitEncodeParams = saved_init_params;
+    params.reInitEncodeParams.encodeConfig = &new_config;
+    params.resetEncoder = 0;
+    params.forceIDR = 0;
+
+    if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &params))) {
+      BOOST_LOG(warning) << "NvEnc: NvEncReconfigureEncoder() failed: " << last_nvenc_error_string;
+      return false;
+    }
+
+    saved_enc_config = new_config;
+    encoder_state.bitrate_changed = true;
+    BOOST_LOG(info) << "NvEnc: bitrate " << old_kbps << " -> " << kbps << " kbps, VBV " << old_vbv << " -> " << new_config.rcParams.vbvBufferSize << " bits";
+    return true;
   }
 
   uint32_t nvenc_base::min_struct_version(uint32_t version, uint32_t v11_struct_version, uint32_t v12_struct_version) {

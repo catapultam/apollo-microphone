@@ -21,6 +21,7 @@ extern "C" {
 // local includes
 #include "process.h"
 #include "live_resize.h"
+#include "adaptive_bitrate.h"
 #include "cbs.h"
 #include "config.h"
 #include "display_device.h"
@@ -419,6 +420,13 @@ namespace video {
       if (!device->nvenc->invalidate_ref_frames(first_frame, last_frame)) {
         force_idr = true;
       }
+    }
+
+    bool set_bitrate(int kbps) override {
+      if (!device || !device->nvenc || kbps <= 0) {
+        return false;
+      }
+      return device->nvenc->reconfigure_bitrate((uint32_t) kbps);
     }
 
     nvenc::nvenc_encoded_frame encode_frame(uint64_t frame_index) {
@@ -1905,12 +1913,14 @@ namespace video {
     int &frame_nr,  // Store progress of the frame number
     safe::mail_t mail,
     img_event_t images,
-    config_t config,
+    config_t &config,  // capture_async owns it; a bitrate applied in place stays for the next encoder
     std::shared_ptr<platf::display_t> disp,
     std::unique_ptr<platf::encode_device_t> encode_device,
     safe::signal_t &reinit_event,
     const encoder_t &encoder,
-    void *channel_data
+    void *channel_data,
+    const std::optional<adaptive_bitrate::change_t> &bitrate_applying,  // the change that this encoder start applies
+    std::optional<adaptive_bitrate::change_t> &bitrate_restart  // set here: restart the encoder at this bitrate
   ) {
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
@@ -1922,6 +1932,14 @@ namespace video {
     // Live resize: tell the control thread that an encoder runs at config.width x config.height.
     // The control thread ignores this when no resize is in progress.
     mail->event<bool>(mail::resize_done)->raise(true);
+
+    // Adaptive bitrate: a restart for a bitrate change is done when the new encoder runs
+    auto bitrate_results = mail->queue<adaptive_bitrate::result_t>(mail::bitrate_result);
+    if (bitrate_applying) {
+      bitrate_results->raise(adaptive_bitrate::result_t {*bitrate_applying, adaptive_bitrate::status_e::applied_restart});
+      BOOST_LOG(info) << "Bitrate request "sv << bitrate_applying->request_id << ": "sv << bitrate_applying->accepted_kbps
+                      << " kbps -> encoder "sv << config.bitrate << " kbps (restart)"sv;
+    }
 
     // As a workaround for NVENC hangs and to generally speed up encoder reinit,
     // we will complete the encoder teardown in a separate thread if supported.
@@ -1953,6 +1971,7 @@ namespace video {
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+    auto bitrate_events = mail->event<adaptive_bitrate::change_t>(mail::bitrate);
 
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
@@ -2012,6 +2031,22 @@ namespace video {
 
       if (requested_idr_frame) {
         session->request_idr_frame();
+      }
+
+      // Adaptive bitrate: change the running encoder, else restart it at the new bitrate
+      if (auto change = bitrate_events->pop(0ms)) {
+        if (change->encoder_kbps == config.bitrate) {
+          bitrate_results->raise(adaptive_bitrate::result_t {*change, adaptive_bitrate::status_e::unchanged});
+        } else if (session->set_bitrate(change->encoder_kbps)) {
+          BOOST_LOG(info) << "Bitrate request "sv << change->request_id << ": "sv << change->accepted_kbps
+                          << " kbps -> encoder "sv << change->encoder_kbps << " kbps (in place)"sv;
+          config.bitrate = change->encoder_kbps;
+          bitrate_results->raise(adaptive_bitrate::result_t {*change, adaptive_bitrate::status_e::applied});
+        } else {
+          // capture_async makes a new encoder at the new bitrate
+          bitrate_restart = *change;
+          break;
+        }
       }
 
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
@@ -2394,6 +2429,13 @@ namespace video {
     config_t last_good_config = config;
     bool resize_pending = false;
 
+    // Adaptive bitrate state (see src/adaptive_bitrate.h)
+    auto bitrate_event = mail->event<adaptive_bitrate::change_t>(mail::bitrate);
+    auto bitrate_results = mail->queue<adaptive_bitrate::result_t>(mail::bitrate_result);
+    std::optional<adaptive_bitrate::change_t> bitrate_restart;  // set by encode_run
+    std::optional<adaptive_bitrate::change_t> bitrate_applying;  // the change of the next encoder start
+    int previous_bitrate = config.bitrate;
+
     // Encoding takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
@@ -2422,6 +2464,18 @@ namespace video {
         config.height = size->second;
         resize_pending = true;
         BOOST_LOG(info) << "Live resize: encoder size set to "sv << config.width << 'x' << config.height;
+      }
+
+      // A bitrate restart from encode_run, or a change that came while no encoder ran.
+      // A change in the mail is newer than the restart request, thus it wins.
+      if (auto change = bitrate_event->pop(0ms)) {
+        bitrate_restart = *change;
+      }
+      if (bitrate_restart) {
+        previous_bitrate = config.bitrate;
+        config.bitrate = bitrate_restart->encoder_kbps;
+        bitrate_applying = bitrate_restart;
+        bitrate_restart.reset();
       }
 
       auto &encoder = *chosen_encoder;
@@ -2454,18 +2508,30 @@ namespace video {
         std::move(encode_device),
         ref->reinit_event,
         *ref->encoder_p,
-        channel_data
+        channel_data,
+        bitrate_applying,
+        bitrate_restart
       );
 
-      // Clear a stale failure flag, then check it only for a resize
+      // Clear a stale failure flag, then check it only for a resize or a bitrate restart
       bool encoder_failed = encoder_failed_event->pop(0ms);
       if (resize_pending && encoder_failed) {
         BOOST_LOG(warning) << "Live resize: encoder rejected "sv << config.width << 'x' << config.height
                            << ", back to "sv << last_good_config.width << 'x' << last_good_config.height;
+        // The revert is for the size only; keep the newest bitrate
+        const int keep_bitrate = config.bitrate;
         config = last_good_config;
+        config.bitrate = keep_bitrate;
         resize_refused_event->raise((std::uint16_t) live_resize::reason_e::encoder_failed);
       }
+      if (bitrate_applying && encoder_failed) {
+        BOOST_LOG(warning) << "Bitrate request "sv << bitrate_applying->request_id << ": encoder failed at "sv << config.bitrate
+                           << " kbps, back to "sv << previous_bitrate << " kbps"sv;
+        config.bitrate = previous_bitrate;
+        bitrate_results->raise(adaptive_bitrate::result_t {*bitrate_applying, adaptive_bitrate::status_e::encoder_failed});
+      }
       resize_pending = false;
+      bitrate_applying.reset();
     }
   }
 

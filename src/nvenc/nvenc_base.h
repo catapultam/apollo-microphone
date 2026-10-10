@@ -69,6 +69,16 @@ namespace nvenc {
      */
     bool invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame);
 
+    /**
+     * @brief Change the bitrate of the running encoder without a new IDR frame.
+     * @details Calls NvEncReconfigureEncoder() with the saved initialization parameters,
+     * a new average bitrate and, when the GPU supports a custom VBV size, a new VBV size.
+     * Only the encode thread may call it, between two encode_frame() calls.
+     * @param kbps New bitrate in kilobits per second.
+     * @return `true` on success. On `false` the encoder runs at the old bitrate.
+     */
+    bool reconfigure_bitrate(uint32_t kbps);
+
   protected:
     /**
      * @brief Required. Used for loading NvEnc library and setting `nvenc` variable with `NvEncodeAPICreateInstance()`.
@@ -141,12 +151,26 @@ namespace nvenc {
                                          ///< Can be set in constructor or `init_library()`, must override `wait_for_async_event()`.
 
   private:
+    /**
+     * @brief VBV size in bits for a bitrate, with the frame rate and the VBV increase of create_encoder().
+     */
+    uint32_t vbv_size(uint32_t kbps) const;
+
+    // Parameters of create_encoder() for reconfigure_bitrate(). nvenc_base is not copyable,
+    // thus saved_init_params.encodeConfig can point to saved_enc_config.
+    NV_ENC_INITIALIZE_PARAMS saved_init_params = {};
+    NV_ENC_CONFIG saved_enc_config = {};
+    uint32_t saved_framerate = 0;
+    int saved_vbv_percentage_increase = 0;
+    bool custom_vbv = false;
+
     NV_ENC_OUTPUT_PTR output_bitstream = nullptr;
     uint32_t minimum_api_version = 0;
 
     struct {
       uint64_t last_encoded_frame_index = 0;
       bool rfi_needs_confirmation = false;
+      bool bitrate_changed = false;  ///< reconfigure_bitrate() succeeded; encode_frame() checks the next frame
       std::pair<uint64_t, uint64_t> last_rfi_range;
       logging::min_max_avg_periodic_logger<double> frame_size_logger = {debug, "NvEnc: encoded frame sizes in kB", ""};
     } encoder_state;

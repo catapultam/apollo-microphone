@@ -213,6 +213,16 @@ namespace video {
     virtual void request_normal_frame() = 0;
 
     virtual void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) = 0;
+
+    /**
+     * @brief Change the bitrate of the running encoder without a new IDR frame.
+     * @param kbps New encoder bitrate (video::config_t::bitrate).
+     * @return True when the encoder runs at the new bitrate now. False when it cannot
+     * change it in place; the caller then makes a new encoder.
+     */
+    virtual bool set_bitrate(int kbps) {
+      return false;
+    }
   };
 
   // encoders
