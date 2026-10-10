@@ -103,10 +103,103 @@ TEST(LiveResizeTests, PendingSlotExpiresAfterTheTimeout) {
   EXPECT_EQ(live_resize::PENDING_TIMEOUT, std::chrono::seconds(60));
 }
 
-TEST(LiveResizeTests, StartsPendingOnlyWhenTheChangeEnded) {
-  EXPECT_TRUE(live_resize::can_start_pending(false, false, true));
-  EXPECT_FALSE(live_resize::can_start_pending(true, false, true));  // Request in progress
-  EXPECT_FALSE(live_resize::can_start_pending(false, true, true));  // Revert thread runs
-  EXPECT_FALSE(live_resize::can_start_pending(true, true, true));
-  EXPECT_FALSE(live_resize::can_start_pending(false, false, false));  // Empty slot
+using live_resize::apply_request;
+using live_resize::pending_action_e;
+using live_resize::pending_slot_t;
+using live_resize::take_pending;
+
+namespace {
+  const auto T0 = std::chrono::steady_clock::time_point {} + std::chrono::hours(1);
+}
+
+TEST(LiveResizeTests, ApplyRequestStoresWhileBusy) {
+  pending_slot_t slot, old;
+  EXPECT_EQ(apply_request(slot, true, 1920, 1080, 2536, 1390, 5, T0, old), request_action_e::store_pending);
+  EXPECT_FALSE(old.set);
+  EXPECT_TRUE(slot.set);
+  EXPECT_EQ(slot.request_id, 5u);
+
+  EXPECT_EQ(apply_request(slot, true, 1920, 1080, 1280, 720, 6, T0, old), request_action_e::store_pending);
+  EXPECT_TRUE(old.set);
+  EXPECT_EQ(old.request_id, 5u);
+  EXPECT_EQ(slot.request_id, 6u);
+  EXPECT_EQ(slot.width, 1280);
+}
+
+TEST(LiveResizeTests, ApplyRequestEqualToTargetClearsTheSlot) {
+  pending_slot_t slot, old;
+  slot.store(1280, 720, 5, T0);
+  EXPECT_EQ(apply_request(slot, true, 1920, 1080, 1920, 1080, 6, T0, old), request_action_e::ignore);
+  EXPECT_TRUE(old.set);
+  EXPECT_FALSE(slot.set);
+}
+
+TEST(LiveResizeTests, ApplyRequestStartWithSlotSetClearsTheSlot) {
+  // A display thread ended after the drain pass, before this packet. The newer request
+  // starts (or the start path refuses it), and the older pending request must not start later.
+  pending_slot_t slot, old;
+  slot.store(2536, 1390, 5, T0);
+  EXPECT_EQ(apply_request(slot, false, 1920, 1080, 1280, 720, 6, T0, old), request_action_e::start);
+  EXPECT_TRUE(old.set);
+  EXPECT_EQ(old.request_id, 5u);
+  EXPECT_FALSE(slot.set);
+
+  pending_slot_t taken;
+  EXPECT_EQ(take_pending(slot, false, false, 1280, 720, T0, taken), pending_action_e::none);
+}
+
+TEST(LiveResizeTests, TakePendingWaitsForTheChangeAndTheThread) {
+  pending_slot_t slot, taken;
+  EXPECT_EQ(take_pending(slot, false, false, 1920, 1080, T0, taken), pending_action_e::none);  // Empty
+
+  slot.store(1280, 720, 5, T0);
+  EXPECT_EQ(take_pending(slot, true, true, 1920, 1080, T0, taken), pending_action_e::none);
+  EXPECT_EQ(take_pending(slot, true, false, 1920, 1080, T0, taken), pending_action_e::none);  // Request in progress
+  EXPECT_EQ(take_pending(slot, false, true, 1920, 1080, T0, taken), pending_action_e::none);  // Revert thread runs
+  EXPECT_TRUE(slot.set);
+
+  EXPECT_EQ(take_pending(slot, false, false, 1920, 1080, T0, taken), pending_action_e::start);
+  EXPECT_FALSE(slot.set);
+  EXPECT_EQ(taken.request_id, 5u);
+  EXPECT_EQ(taken.width, 1280);
+  EXPECT_EQ(taken.height, 720);
+}
+
+TEST(LiveResizeTests, TakePendingDropsTheCurrentSize) {
+  // In progress A from S, pending S, A refused: the current size is S again
+  pending_slot_t slot, taken;
+  slot.store(1920, 1080, 5, T0);
+  EXPECT_EQ(take_pending(slot, false, false, 1920, 1080, T0, taken), pending_action_e::drop);
+  EXPECT_FALSE(slot.set);
+  EXPECT_EQ(taken.request_id, 5u);
+}
+
+TEST(LiveResizeTests, TakePendingRefusesWithBusyAfterTheTimeout) {
+  pending_slot_t slot, taken;
+  slot.store(1280, 720, 5, T0);
+  slot.store(1600, 900, 6, T0 + std::chrono::seconds(50));
+  EXPECT_EQ(take_pending(slot, true, true, 1920, 1080, T0 + live_resize::PENDING_TIMEOUT, taken), pending_action_e::none);
+  EXPECT_EQ(take_pending(slot, true, true, 1920, 1080, T0 + live_resize::PENDING_TIMEOUT + std::chrono::seconds(1), taken), pending_action_e::refuse_busy);
+  EXPECT_FALSE(slot.set);
+  EXPECT_EQ(taken.request_id, 6u);  // BUSY uses the id and size of the latest request
+  EXPECT_EQ(taken.width, 1600);
+}
+
+TEST(LiveResizeTests, DrainOrderStartsTheLatestRequestOnce) {
+  // Drain order in stream.cpp: refusals, done check, watchdog, then the pending slot.
+  // A in progress; B, then C, arrive while busy; A is refused with ENCODER_FAILED.
+  pending_slot_t slot, old, taken;
+  int current_w = 2536, current_h = 1390;  // Target of A
+  EXPECT_EQ(apply_request(slot, true, current_w, current_h, 1280, 720, 2, T0, old), request_action_e::store_pending);
+  EXPECT_EQ(apply_request(slot, true, current_w, current_h, 1600, 900, 3, T0, old), request_action_e::store_pending);
+
+  // The refusal loop sets the size back and starts the revert thread in the same pass
+  current_w = 1920;
+  current_h = 1080;
+  EXPECT_EQ(take_pending(slot, false, true, current_w, current_h, T0, taken), pending_action_e::none);
+
+  // A later pass, after the revert thread ended: C starts, B never starts
+  EXPECT_EQ(take_pending(slot, false, false, current_w, current_h, T0, taken), pending_action_e::start);
+  EXPECT_EQ(taken.request_id, 3u);
+  EXPECT_EQ(take_pending(slot, false, false, current_w, current_h, T0, taken), pending_action_e::none);
 }

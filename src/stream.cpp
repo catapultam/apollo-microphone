@@ -445,7 +445,7 @@ namespace stream {
       std::atomic<std::uint32_t> worker_id {0};  ///< Id of the running display thread, 0 when none
       int width = 0;  ///< Size the host targets now; the control thread writes it
       int height = 0;
-      int last_width = 0;  ///< Size before the pending request, for the revert
+      int last_width = 0;  ///< Size before the request in progress, for the revert
       int last_height = 0;
       std::uint32_t request_id = 0;
       std::uint32_t vdd_generation = 0;  ///< proc::vdd_generation at the request
@@ -1358,25 +1358,28 @@ namespace stream {
 
       // A request in progress or a display thread that still runs makes the host busy
       const bool busy = resize.in_progress || resize.worker_id.load(std::memory_order_acquire) != 0;
-      switch (live_resize::decide_request(busy, resize.width, resize.height, width, height)) {
+      live_resize::pending_slot_t old_pending;
+      const auto action = live_resize::apply_request(resize.pending, busy, resize.width, resize.height, width, height, request_id, std::chrono::steady_clock::now(), old_pending);
+      if (old_pending.set && action != live_resize::request_action_e::store_pending) {
+        // This request is newer; the pending request must not start after it
+        BOOST_LOG(info) << "Resize request "sv << request_id << " to "sv << width << 'x' << height
+                        << " removes pending request "sv << old_pending.request_id << " to "sv << old_pending.width << 'x' << old_pending.height;
+      }
+      switch (action) {
         case live_resize::request_action_e::ignore:
-          if (resize.pending.set) {
-            BOOST_LOG(info) << "Resize request "sv << request_id << " to "sv << width << 'x' << height
-                            << " is equal to the size that the host targets, pending request "sv << resize.pending.request_id << " removed"sv;
-            resize.pending.clear();
-          } else {
-            BOOST_LOG(debug) << "Resize request "sv << request_id << " to "sv << width << 'x' << height << " is equal to the size that the host targets, ignored"sv;
-          }
+          BOOST_LOG(debug) << "Resize request "sv << request_id << " to "sv << width << 'x' << height << " is equal to the size that the host targets, ignored"sv;
           return;
         case live_resize::request_action_e::store_pending:
-          if (resize.pending.set) {
+          if (old_pending.set) {
             BOOST_LOG(info) << "Resize request "sv << request_id << " to "sv << width << 'x' << height
-                            << " replaces pending request "sv << resize.pending.request_id;
-          } else {
+                            << " replaces pending request "sv << old_pending.request_id;
+          } else if (resize.in_progress) {
             BOOST_LOG(info) << "Resize request "sv << request_id << " to "sv << width << 'x' << height
                             << " waits for request "sv << resize.request_id;
+          } else {
+            BOOST_LOG(info) << "Resize request "sv << request_id << " to "sv << width << 'x' << height
+                            << " waits for the display thread"sv;
           }
-          resize.pending.store(width, height, request_id, std::chrono::steady_clock::now());
           return;
         case live_resize::request_action_e::start:
           break;
@@ -1599,22 +1602,25 @@ namespace stream {
 
             // Start the pending request when the change before it ended. Read worker_id again:
             // the refusal loop above can start a revert thread.
-            if (live_resize::can_start_pending(resize.in_progress, resize.worker_id.load(std::memory_order_acquire) != 0, resize.pending.set)) {
-              const auto pending = resize.pending;
-              resize.pending.clear();
-              if (live_resize::decide_request(false, resize.width, resize.height, pending.width, pending.height) == live_resize::request_action_e::ignore) {
-                BOOST_LOG(info) << "Pending resize request "sv << pending.request_id << " to "sv << pending.width << 'x' << pending.height
-                                << " is equal to the current size, ignored"sv;
-              } else {
+            live_resize::pending_slot_t pending;
+            switch (live_resize::take_pending(resize.pending, resize.in_progress, resize.worker_id.load(std::memory_order_acquire) != 0, resize.width, resize.height, now, pending)) {
+              case live_resize::pending_action_e::none:
+                break;
+              case live_resize::pending_action_e::start:
                 BOOST_LOG(info) << "Pending resize request "sv << pending.request_id << " starts"sv;
                 start_resize_request(session, pending.width, pending.height, pending.request_id);
-              }
-            } else if (resize.pending.expired(now)) {
-              // The change before it did not end, for example because a display thread does
-              // not return. Do not keep the request forever.
-              const auto pending = resize.pending;
-              resize.pending.clear();
-              send_resize_refused(session, (std::uint16_t) pending.width, (std::uint16_t) pending.height, pending.request_id, (std::uint16_t) live_resize::reason_e::busy);
+                break;
+              case live_resize::pending_action_e::drop:
+                BOOST_LOG(info) << "Pending resize request "sv << pending.request_id << " to "sv << pending.width << 'x' << pending.height
+                                << " is equal to the current size, ignored"sv;
+                break;
+              case live_resize::pending_action_e::refuse_busy:
+                // The change before it did not end, for example because a display thread does
+                // not return. Do not keep the request forever.
+                BOOST_LOG(warning) << "Pending resize request "sv << pending.request_id << " to "sv << pending.width << 'x' << pending.height
+                                   << " could not start in 60 s"sv;
+                send_resize_refused(session, (std::uint16_t) pending.width, (std::uint16_t) pending.height, pending.request_id, (std::uint16_t) live_resize::reason_e::busy);
+                break;
             }
           }
 

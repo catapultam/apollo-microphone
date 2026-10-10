@@ -150,14 +150,70 @@ namespace live_resize {
   };
 
   /**
-   * @brief Check if the control thread can start the pending request now.
-   * @param in_progress True when a request is in progress.
-   * @param worker_running True when a display thread runs (worker_id != 0).
-   * @param pending_set True when the pending slot is set.
-   * @return True when the slot is set and the change before it ended.
+   * @brief Apply a RESIZE_REQUEST to the pending slot and select the action.
+   * @param slot The pending slot. The function stores the request in it, or clears it.
+   * @param busy True when a request is in progress or a display thread runs.
+   * @param target_width Size that the host targets now (see decide_request()).
+   * @param target_height See target_width.
+   * @param width Requested width.
+   * @param height Requested height.
+   * @param request_id Request id from the client.
+   * @param now Current time.
+   * @param old_slot Gets the slot as it was before the call, for the log.
+   * @return The action. For ignore and start the function clears the slot: this request is
+   * newer than the pending request, thus the pending request must not start after it.
+   * Also when the start path refuses this request.
    */
-  constexpr bool can_start_pending(bool in_progress, bool worker_running, bool pending_set) {
-    return pending_set && !in_progress && !worker_running;
+  inline request_action_e apply_request(pending_slot_t &slot, bool busy, int target_width, int target_height, int width, int height, std::uint32_t request_id, std::chrono::steady_clock::time_point now, pending_slot_t &old_slot) {
+    old_slot = slot;
+    const auto action = decide_request(busy, target_width, target_height, width, height);
+    if (action == request_action_e::store_pending) {
+      slot.store(width, height, request_id, now);
+    } else {
+      slot.clear();
+    }
+    return action;
+  }
+
+  /**
+   * @brief What the control thread does with the pending slot in one pass.
+   */
+  enum class pending_action_e {
+    none,  ///< The slot is empty, or the change before it did not end yet
+    start,  ///< Start the pending request through the start path
+    drop,  ///< The pending size is the current size. Send no reply.
+    refuse_busy,  ///< The request could not start in PENDING_TIMEOUT. Refuse it with BUSY.
+  };
+
+  /**
+   * @brief Select the action for the pending slot, after the refusals, the done check and the watchdog.
+   * @param slot The pending slot. The function clears it for each action except none.
+   * @param in_progress True when a request is in progress.
+   * @param worker_running True when a display thread runs (worker_id != 0). Read it again
+   * after the refusals: the refusal loop can start a revert thread.
+   * @param current_width Current stream size that the host tracks.
+   * @param current_height See current_width.
+   * @param now Current time.
+   * @param taken Gets the pending request for each action except none.
+   * @return The action.
+   */
+  inline pending_action_e take_pending(pending_slot_t &slot, bool in_progress, bool worker_running, int current_width, int current_height, std::chrono::steady_clock::time_point now, pending_slot_t &taken) {
+    if (!slot.set) {
+      return pending_action_e::none;
+    }
+    pending_action_e action;
+    if (!in_progress && !worker_running) {
+      action = decide_request(false, current_width, current_height, slot.width, slot.height) == request_action_e::ignore ?
+                 pending_action_e::drop :
+                 pending_action_e::start;
+    } else if (slot.expired(now)) {
+      action = pending_action_e::refuse_busy;
+    } else {
+      return pending_action_e::none;
+    }
+    taken = slot;
+    slot.clear();
+    return action;
   }
 
 #ifdef _WIN32
