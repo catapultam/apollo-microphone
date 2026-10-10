@@ -34,6 +34,10 @@ namespace adaptive_bitrate {
   // Minimum time between two encoder restarts for a bitrate change
   constexpr auto RESTART_INTERVAL = std::chrono::seconds(2);
 
+  // Minimum time between two releases. An in-place change runs NvEncReconfigureEncoder();
+  // this limit stops a client that makes it run at each frame.
+  constexpr auto RELEASE_INTERVAL = std::chrono::milliseconds(500);
+
   // The control thread clears a released request without a result after this time
   constexpr auto IN_FLIGHT_TIMEOUT = std::chrono::seconds(5);
 
@@ -222,6 +226,7 @@ namespace adaptive_bitrate {
     std::optional<change_t> pending;  ///< Newest request that is not released
     std::optional<change_t> in_flight;  ///< Newest released request without a result
     std::chrono::steady_clock::time_point in_flight_since;
+    std::optional<std::chrono::steady_clock::time_point> last_release;  ///< Time of the last release
     bool restart_mode = false;  ///< Set after the first encoder restart for a change
     std::chrono::steady_clock::time_point last_restart;
     /// Values of the newest answer that the client uses (UNCHANGED, or the result of the
@@ -301,19 +306,32 @@ namespace adaptive_bitrate {
      * @param resize_busy True when a live resize request is in progress or its display
      * thread runs. capture_async takes a pending resize size at the top of each loop, thus
      * a restart for a bitrate change must not start a loop before the display changes.
+     * The function checks resize_busy only at the release. A resize that starts just after
+     * a release can share the encoder restart of the bitrate change (accepted, spec 4.6).
+     * @details Before the first restart, a change can be in place or a restart. The function
+     * does not release while that change is in flight, thus a restart (AMF, Quick Sync,
+     * software) ends before the next release. After the first restart, RESTART_INTERVAL
+     * applies. RELEASE_INTERVAL applies to all releases.
      * @return The change to raise on mail::bitrate, or no value.
      */
     std::optional<change_t> take_release(std::chrono::steady_clock::time_point now, bool resize_busy) {
       if (!pending || resize_busy) {
         return std::nullopt;
       }
+      if (in_flight && !restart_mode) {
+        return std::nullopt;
+      }
       if (restart_mode && now - last_restart < RESTART_INTERVAL) {
+        return std::nullopt;
+      }
+      if (last_release && now - *last_release < RELEASE_INTERVAL) {
         return std::nullopt;
       }
       const change_t change = *pending;
       pending.reset();
       in_flight = change;
       in_flight_since = now;
+      last_release = now;
       return change;
     }
 

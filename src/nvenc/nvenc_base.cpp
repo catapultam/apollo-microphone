@@ -6,7 +6,9 @@
 #include "nvenc_base.h"
 
 // standard includes
+#include <algorithm>
 #include <format>
+#include <limits>
 
 // local includes
 #include "src/config.h"
@@ -25,10 +27,18 @@
 #endif
 
 namespace {
-  // Spike S1 (adaptive bitrate plan, Task 2): true when NvEncReconfigureEncoder() can also
-  // change vbvBufferSize. The test on RTX 5070 and RTX 4090 passed (outcome A).
-  // Outcome B sets it to false.
+  // True when NvEncReconfigureEncoder() also changes vbvBufferSize. A test of
+  // NvEncReconfigureEncoder() with a new average bitrate and VBV size on RTX 5070 and RTX 4090
+  // passed: the change works and makes no IDR frame.
   constexpr bool RECONFIGURE_VBV = true;
+
+  /**
+   * @brief Convert kbps to bits per second for a uint32_t NVENC field.
+   * @return kbps * 1000, clamped to the maximum of uint32_t.
+   */
+  uint32_t kbps_to_bps(uint64_t kbps) {
+    return (uint32_t) std::min<uint64_t>(kbps * 1000, (std::numeric_limits<uint32_t>::max)());
+  }
 }  // namespace
 
 namespace {
@@ -252,7 +262,7 @@ namespace nvenc {
                                                                                             NV_ENC_MULTI_PASS_DISABLED;
 
     enc_config.rcParams.enableAQ = config.adaptive_quantization;
-    enc_config.rcParams.averageBitRate = client_config.bitrate * 1000;
+    enc_config.rcParams.averageBitRate = kbps_to_bps(client_config.bitrate);
 
     saved_framerate = client_config.framerate;
     saved_vbv_percentage_increase = config.vbv_percentage_increase;
@@ -564,7 +574,7 @@ namespace nvenc {
     };
 
     if (encoder_state.bitrate_changed) {
-      // Spike S1 on the real path: an in-place bitrate change must not make an IDR frame.
+      // An in-place bitrate change must not make an IDR frame.
       // The first frame of a new encoder is always an IDR frame; create_encoder() sets
       // last_encoded_frame_index to 0, thus that frame does not cause the warning.
       encoder_state.bitrate_changed = false;
@@ -687,11 +697,12 @@ namespace nvenc {
 
   uint32_t nvenc_base::vbv_size(uint32_t kbps) const {
     // The formula of create_encoder(): one frame at the bitrate, plus the VBV increase
-    uint32_t size = kbps * 1000 / saved_framerate;
+    // 64-bit math: kbps * 1000 and the increase can overflow uint32_t
+    uint64_t size = (uint64_t) kbps * 1000 / saved_framerate;
     if (saved_vbv_percentage_increase > 0) {
       size += size * saved_vbv_percentage_increase / 100;
     }
-    return size;
+    return (uint32_t) std::min<uint64_t>(size, (std::numeric_limits<uint32_t>::max)());
   }
 
   bool nvenc_base::reconfigure_bitrate(uint32_t kbps) {
@@ -702,7 +713,7 @@ namespace nvenc {
     NV_ENC_CONFIG new_config = saved_enc_config;
     const uint32_t old_kbps = new_config.rcParams.averageBitRate / 1000;
     const uint32_t old_vbv = new_config.rcParams.vbvBufferSize;
-    new_config.rcParams.averageBitRate = kbps * 1000;
+    new_config.rcParams.averageBitRate = kbps_to_bps(kbps);
     if (custom_vbv && RECONFIGURE_VBV) {
       new_config.rcParams.vbvBufferSize = vbv_size(kbps);
     }

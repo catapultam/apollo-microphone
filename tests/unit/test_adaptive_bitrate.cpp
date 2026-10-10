@@ -211,30 +211,55 @@ TEST(AdaptiveBitrateState, RestartModeKeepsTwoSecondsBetweenRestarts) {
   EXPECT_TRUE(state.take_release(t0 + 2500ms, false).has_value());
 }
 
-TEST(AdaptiveBitrateState, InPlaceChangesHaveNoInterval) {
+TEST(AdaptiveBitrateState, InPlaceChangesKeepTheReleaseInterval) {
+  // An in-place change has no restart interval, but RELEASE_INTERVAL applies
   auto state = started_state();
   const auto t0 = std::chrono::steady_clock::now();
   std::optional<change_t> replaced;
   state.on_request(make_change(1, 20000), replaced);
-  state.take_release(t0, false);
+  ASSERT_TRUE(state.take_release(t0, false).has_value());
   state.on_result({make_change(1, 20000), status_e::applied}, t0 + 20ms);
   EXPECT_FALSE(state.restart_mode);
   state.on_request(make_change(2, 15000), replaced);
-  EXPECT_TRUE(state.take_release(t0 + 40ms, false).has_value());
+  EXPECT_FALSE(state.take_release(t0 + 40ms, false).has_value());
+  EXPECT_FALSE(state.take_release(t0 + 499ms, false).has_value());
+  EXPECT_TRUE(state.take_release(t0 + 500ms, false).has_value());
 }
 
-TEST(AdaptiveBitrateState, ResultOfAnOlderRequestKeepsInFlight) {
+TEST(AdaptiveBitrateState, NoReleaseWhileTheFirstChangeIsInFlight) {
+  // Before the first restart, the change in flight can be a restart (AMF, Quick Sync,
+  // software). The next change waits for its result or for the watchdog.
   auto state = started_state();
   const auto t0 = std::chrono::steady_clock::now();
   std::optional<change_t> replaced;
   state.on_request(make_change(1, 20000), replaced);
-  state.take_release(t0, false);
+  ASSERT_TRUE(state.take_release(t0, false).has_value());
   state.on_request(make_change(2, 15000), replaced);
-  state.take_release(t0 + 10ms, false);  // the mail keeps only request 2
-  EXPECT_FALSE(state.on_result({make_change(1, 20000), status_e::applied}, t0 + 20ms));
+  EXPECT_FALSE(state.take_release(t0 + 1s, false).has_value());
+  EXPECT_FALSE(state.take_release(t0 + 4s, false).has_value());
+
+  // After the watchdog, the next change goes
+  EXPECT_TRUE(state.watchdog(t0 + 5001ms));
+  auto released = state.take_release(t0 + 5001ms, false);
+  ASSERT_TRUE(released.has_value());
+  EXPECT_EQ(released->request_id, 2u);
+}
+
+TEST(AdaptiveBitrateState, ResultOfAnOlderRequestKeepsInFlight) {
+  // In restart mode, a release while a change is in flight is allowed after the intervals
+  auto state = started_state();
+  const auto t0 = std::chrono::steady_clock::now();
+  state.restart_mode = true;
+  state.last_restart = t0 - 3s;
+  std::optional<change_t> replaced;
+  state.on_request(make_change(1, 20000), replaced);
+  ASSERT_TRUE(state.take_release(t0, false).has_value());
+  state.on_request(make_change(2, 15000), replaced);
+  ASSERT_TRUE(state.take_release(t0 + 500ms, false).has_value());  // the mail keeps only request 2
+  EXPECT_FALSE(state.on_result({make_change(1, 20000), status_e::applied}, t0 + 520ms));
   ASSERT_TRUE(state.in_flight.has_value());
   EXPECT_EQ(state.in_flight->request_id, 2u);
-  EXPECT_TRUE(state.on_result({make_change(2, 15000), status_e::applied}, t0 + 30ms));
+  EXPECT_TRUE(state.on_result({make_change(2, 15000), status_e::applied}, t0 + 530ms));
   EXPECT_FALSE(state.in_flight.has_value());
   EXPECT_EQ(state.encoder_kbps, 15000);
 }

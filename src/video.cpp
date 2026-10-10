@@ -1755,7 +1755,8 @@ namespace video {
         }
       }
 
-      auto bitrate = config.bitrate * 1000;
+      // 64-bit math: config.bitrate * 1000 can overflow int. The FFmpeg fields are int64_t.
+      const std::int64_t bitrate = (std::int64_t) config.bitrate * 1000;
       ctx->rc_max_rate = bitrate;
       ctx->bit_rate = bitrate;
 
