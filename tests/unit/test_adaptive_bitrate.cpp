@@ -293,7 +293,8 @@ TEST(AdaptiveBitrateState, LateResultAfterWatchdogReappliesTheToldValue) {
   ASSERT_TRUE(state.pending.has_value());
   EXPECT_EQ(state.pending->request_id, 2u);
   EXPECT_EQ(state.pending->encoder_kbps, 30000);
-  EXPECT_EQ(state.pending->accepted_kbps, 40000u);  // UNCHANGED gave the running values
+  EXPECT_EQ(state.pending->accepted_kbps, 37500u);  // UNCHANGED gave the values of request 2
+  EXPECT_EQ(state.pending->requested_kbps, 37500u);
 
   // The restart interval applies to the re-apply
   EXPECT_FALSE(state.take_release(t0 + 7s, false).has_value());
@@ -303,6 +304,38 @@ TEST(AdaptiveBitrateState, LateResultAfterWatchdogReappliesTheToldValue) {
   EXPECT_TRUE(state.on_result({*released, status_e::applied_restart}, t0 + 9s));
   EXPECT_EQ(state.encoder_kbps, 30000);
   EXPECT_FALSE(state.pending.has_value());
+}
+
+TEST(AdaptiveBitrateState, ReapplyAfterTruncationKeepsTheAcceptedValueOfTheRequest) {
+  // With FEC 20 %, 1000 and 1001 kbps give the same encoder value. The UNCHANGED answer for
+  // 1001 gives accepted 1001. A re-apply of these values must not give accepted < requested,
+  // else the client takes it as a host cap.
+  adaptive_bitrate::chain_input_t input;
+  input.configured_kbps = 1000;
+  const auto start = adaptive_bitrate::encoder_bitrate(input);
+  input.configured_kbps = 1001;
+  const auto other = adaptive_bitrate::encoder_bitrate(input);
+  ASSERT_EQ(start.encoder_kbps, other.encoder_kbps);
+
+  state_t state;
+  state.encoder_kbps = (int) start.encoder_kbps;
+  state.accepted_kbps = (std::uint32_t) start.accepted_kbps;
+  const auto t0 = std::chrono::steady_clock::now();
+  std::optional<change_t> replaced;
+  state.on_request(make_change(1, 20000), replaced);
+  state.take_release(t0, false);
+  EXPECT_TRUE(state.watchdog(t0 + 5001ms));
+  const change_t request2 {2, (int) other.encoder_kbps, 1001, (std::uint32_t) other.accepted_kbps};
+  EXPECT_TRUE(state.on_request(request2, replaced));
+
+  EXPECT_FALSE(state.on_result({make_change(1, 20000), status_e::applied_restart}, t0 + 6s));
+  auto released = state.take_release(t0 + 8s, false);
+  ASSERT_TRUE(released.has_value());
+  EXPECT_EQ(released->request_id, 2u);
+  EXPECT_EQ(released->encoder_kbps, (int) start.encoder_kbps);
+  EXPECT_EQ(released->requested_kbps, 1001u);
+  EXPECT_EQ(released->accepted_kbps, 1001u);
+  EXPECT_GE(released->accepted_kbps, released->requested_kbps);
 }
 
 TEST(AdaptiveBitrateState, LateResultWithoutAnAnswerReappliesTheStartValue) {

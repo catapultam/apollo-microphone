@@ -239,7 +239,10 @@ namespace adaptive_bitrate {
     bool on_request(const change_t &change, std::optional<change_t> &replaced) {
       replaced.reset();
       if (change.encoder_kbps == encoder_kbps && !pending && !in_flight) {
-        told = change_t {change.request_id, encoder_kbps, change.requested_kbps, accepted_kbps};
+        // The UNCHANGED answer gives the values of the request (spec 5.2 step 7). The chain
+        // can give one encoder value for two configured values, thus accepted_kbps can differ
+        // from the running value.
+        told = change;
         return true;
       }
       replaced = pending;
