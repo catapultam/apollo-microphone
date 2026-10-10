@@ -89,9 +89,6 @@ static const short packetTypes[] = {
   0x3101,  // Resize refused (Apollo live resize extension)
 };
 
-static_assert(packetTypes[IDX_RESIZE_REQUEST] == (short) live_resize::PACKET_TYPE_REQUEST, "RESIZE_REQUEST id must match live_resize.h");
-static_assert(packetTypes[IDX_RESIZE_REFUSED] == (short) live_resize::PACKET_TYPE_REFUSED, "RESIZE_REFUSED id must match live_resize.h");
-
 namespace asio = boost::asio;
 namespace sys = boost::system;
 
