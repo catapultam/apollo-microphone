@@ -13,6 +13,7 @@
 
 // local includes
 #include "audio.h"
+#include "adaptive_bitrate.h"
 #include "crypto.h"
 #include "video.h"
 
@@ -27,6 +28,7 @@ namespace stream {
   struct config_t {
     audio::config_t audio;
     video::config_t monitor;
+    adaptive_bitrate::chain_input_t bitrate_chain;  ///< Bitrate chain of cmd_announce; SET_BITRATE uses it again
 
     int packetsize;
     int minRequiredFecPackets;

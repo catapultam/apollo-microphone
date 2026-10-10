@@ -798,6 +798,13 @@ namespace rtsp_stream {
     }
 #endif
 
+    // Adaptive bitrate (Apollo extension). Only capture_async reads a bitrate change, and
+    // only an encoder with PARALLEL_ENCODING uses capture_async. encoder_supports_live_resize()
+    // tests exactly this flag.
+    if (video::encoder_supports_live_resize()) {
+      ss << "a=x-ss-general.dynamicBitrate:1"sv << std::endl;
+    }
+
     // Always request new control stream encryption if the client supports it
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;
     uint32_t encryption_flags_requested = SS_ENC_CONTROL_V2;
@@ -1071,20 +1078,10 @@ namespace rtsp_stream {
 
       BOOST_LOG(info) << "Client Requested bitrate is [" << configuredBitrateKbps << "kbps]";
 
-      if (config::video.max_bitrate > 0) {
-        if (config::video.max_bitrate < configuredBitrateKbps) {
-          configuredBitrateKbps = config::video.max_bitrate;
-        }
-      }
-
-      BOOST_LOG(info) << "Host Streaming bitrate is [" << configuredBitrateKbps << "kbps]";
-
-      // Hack: Restore bitrate for warp mode
+      // Hack: Restore bitrate for warp mode. adaptive_bitrate::encoder_bitrate() applies it.
       size_t warp_factor = std::round((float)config.monitor.framerate * 1000 / session.fps);
-      if (config::video.limit_framerate && warp_factor >= 2) {
-        configuredBitrateKbps *= warp_factor;
-        BOOST_LOG(info) << "Warp factor [" << warp_factor << "] engaged";
-      }
+      config.bitrate_chain.limit_framerate = config::video.limit_framerate;
+      config.bitrate_chain.warp_factor = (config::video.limit_framerate && warp_factor >= 2) ? warp_factor : 1;
 
     } catch (std::out_of_range &) {
       respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
@@ -1131,27 +1128,24 @@ namespace rtsp_stream {
     // If the client sent a configured bitrate, we will choose the actual bitrate ourselves
     // by using FEC percentage and audio quality settings. If the calculated bitrate ends up
     // too low, we'll allow it to exceed the limits rather than reducing the encoding bitrate
-    // down to nearly nothing.
-    if (configuredBitrateKbps) {
-      BOOST_LOG(debug) << "Client configured bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
-
-      // If the FEC percentage isn't too high, adjust the configured bitrate to ensure video
-      // traffic doesn't exceed the user's selected bitrate when the FEC shards are included.
-      if (config::stream.fec_percentage <= 80) {
-        configuredBitrateKbps /= 100.f / (100 - config::stream.fec_percentage);
+    // down to nearly nothing. The control stream uses the same chain for SET_BITRATE
+    // (adaptive_bitrate::encoder_bitrate()), thus the audio flags must be final here.
+    config.bitrate_chain.configured_kbps = configuredBitrateKbps;
+    config.bitrate_chain.max_bitrate = config::video.max_bitrate;
+    config.bitrate_chain.fec_percentage = config::stream.fec_percentage;
+    config.bitrate_chain.audio_high_quality = config.audio.flags[audio::config_t::HIGH_QUALITY];
+    config.bitrate_chain.audio_channels = config.audio.channels;
+    {
+      const auto chain = adaptive_bitrate::encoder_bitrate(config.bitrate_chain);
+      BOOST_LOG(info) << "Host Streaming bitrate is [" << chain.accepted_kbps << "kbps]";
+      if (config.bitrate_chain.warp_factor >= 2) {
+        BOOST_LOG(info) << "Warp factor [" << config.bitrate_chain.warp_factor << "] engaged";
       }
-
-      // Adjust the bitrate to account for audio traffic bandwidth usage (capped at 20% reduction).
-      // The bitrate per channel is 256 Kbps for high quality mode and 96 Kbps for normal quality.
-      auto audioBitrateAdjustment = (config.audio.flags[audio::config_t::HIGH_QUALITY] ? 256 : 96) * config.audio.channels;
-      configuredBitrateKbps -= std::min((std::int64_t) audioBitrateAdjustment, configuredBitrateKbps / 5);
-
-      // Reduce it by another 500Kbps to account for A/V packet overhead and control data
-      // traffic (capped at 10% reduction).
-      configuredBitrateKbps -= std::min((std::int64_t) 500, configuredBitrateKbps / 10);
-
-      BOOST_LOG(debug) << "Final adjusted video encoding bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
-      config.monitor.bitrate = configuredBitrateKbps;
+      if (configuredBitrateKbps) {
+        BOOST_LOG(debug) << "Client configured bitrate is "sv << chain.accepted_kbps * (std::int64_t) config.bitrate_chain.warp_factor << " Kbps"sv;
+        BOOST_LOG(debug) << "Final adjusted video encoding bitrate is "sv << chain.encoder_kbps << " Kbps"sv;
+        config.monitor.bitrate = (int) chain.encoder_kbps;
+      }
     }
 
     if (config.monitor.videoFormat == 1 && video::active_hevc_mode == 1) {

@@ -29,6 +29,7 @@ extern "C" {
 #include "logging.h"
 #include "network.h"
 #include "platform/common.h"
+#include "adaptive_bitrate.h"
 #include "live_resize.h"
 #include "process.h"
 #include "rtsp.h"
@@ -58,6 +59,8 @@ extern "C" {
 #define IDX_SET_ADAPTIVE_TRIGGERS 18
 #define IDX_RESIZE_REQUEST 19
 #define IDX_RESIZE_REFUSED 20
+#define IDX_SET_BITRATE 21
+#define IDX_BITRATE_STATUS 22
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -81,6 +84,8 @@ static const short packetTypes[] = {
   0x5503,  // Set Adaptive triggers (Sunshine protocol extension)
   0x3100,  // Resize request (Apollo live resize extension)
   0x3101,  // Resize refused (Apollo live resize extension)
+  0x3102,  // Set bitrate (Apollo adaptive bitrate extension)
+  0x3103,  // Bitrate status (Apollo adaptive bitrate extension)
 };
 
 namespace asio = boost::asio;
@@ -258,6 +263,12 @@ namespace stream {
     control_header_v2 header;
 
     live_resize::refused_payload_t payload;
+  };
+
+  struct control_bitrate_status_t {
+    control_header_v2 header;
+
+    std::array<std::uint8_t, adaptive_bitrate::STATUS_PAYLOAD_SIZE> payload;  ///< adaptive_bitrate::encode_status()
   };
 
 #pragma pack(pop)
@@ -456,6 +467,13 @@ namespace stream {
       safe::mail_raw_t::event_t<std::uint16_t> refused_queue;  ///< Reason from a display thread or capture_async
       safe::mail_raw_t::event_t<bool> done_queue;  ///< Raised by encode_run at each encoder start
     } resize;
+
+    // Adaptive bitrate state (see src/adaptive_bitrate.h). Only the control thread uses it.
+    struct {
+      adaptive_bitrate::state_t state;
+      safe::mail_raw_t::event_t<adaptive_bitrate::change_t> change_queue;  ///< Change for encode_run or capture_async
+      safe::mail_raw_t::queue_t<adaptive_bitrate::result_t> result_queue;  ///< Results of encode_run and capture_async
+    } bitrate;
 
     std::uint32_t launch_session_id;
     std::string device_name;
@@ -1007,6 +1025,57 @@ namespace stream {
     return 0;
   }
 
+  /**
+   * @brief Send BITRATE_STATUS to the client.
+   * @details Only the control thread may call this, because ENet is not thread safe.
+   */
+  int send_bitrate_status(session_t *session, const adaptive_bitrate::status_t &status) {
+    if (!session->control.peer) {
+      BOOST_LOG(warning) << "Could not send bitrate status, still waiting for PING from Moonlight"sv;
+      return -1;
+    }
+
+    control_bitrate_status_t plaintext {};
+    plaintext.header.type = packetTypes[IDX_BITRATE_STATUS];
+    plaintext.header.payloadLength = adaptive_bitrate::STATUS_PAYLOAD_SIZE;
+    plaintext.payload = adaptive_bitrate::encode_status(status);
+
+    std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
+      encrypted_payload;
+
+    auto payload = encode_control(session, util::view(plaintext), encrypted_payload);
+    if (session->broadcast_ref->control_server.send(payload, session->control.peer)) {
+      TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
+      BOOST_LOG(warning) << "Could not send bitrate status to ["sv << addr << ':' << port << ']';
+      return -1;
+    }
+    return 0;
+  }
+
+  /**
+   * @brief Answer a SET_BITRATE request.
+   * @details APPLIED, APPLIED_RESTART and UNCHANGED give the values of the change. The other
+   * codes give the values that run now. Only the control thread may call this.
+   */
+  static void answer_bitrate(session_t *session, const adaptive_bitrate::change_t &change, adaptive_bitrate::status_e status) {
+    using adaptive_bitrate::status_e;
+    const bool runs = status == status_e::applied || status == status_e::applied_restart || status == status_e::unchanged;
+    const auto &state = session->bitrate.state;
+    const adaptive_bitrate::status_t message {
+      change.request_id,
+      change.requested_kbps,
+      runs ? change.accepted_kbps : state.accepted_kbps,
+      (std::uint32_t) (runs ? change.encoder_kbps : state.encoder_kbps),
+      status,
+    };
+    send_bitrate_status(session, message);
+    // encode_run writes the info log for APPLIED and APPLIED_RESTART (spec 5.8)
+    auto &level = (status == status_e::applied || status == status_e::applied_restart) ? debug : info;
+    BOOST_LOG(level) << "Bitrate request "sv << change.request_id << ": "sv << adaptive_bitrate::status_name(status)
+                     << ", requested "sv << message.requested_kbps << " kbps, accepted "sv << message.accepted_kbps
+                     << " kbps, encoder "sv << message.encoder_kbps << " kbps"sv;
+  }
+
 #ifdef _WIN32
   /**
    * @brief Make a new id for a live resize display thread.
@@ -1388,6 +1457,41 @@ namespace stream {
       start_resize_request(session, width, height, request_id);
     });
 
+    server->map(packetTypes[IDX_SET_BITRATE], [](session_t *session, const std::string_view &payload) {
+      BOOST_LOG(debug) << "type [IDX_SET_BITRATE]"sv;
+
+      auto request = adaptive_bitrate::decode_request(payload);
+      if (!request) {
+        BOOST_LOG(warning) << "Bitrate request: runt payload of "sv << payload.size() << " bytes"sv;
+        return;
+      }
+
+      adaptive_bitrate::change_t change;
+      change.request_id = request->request_id;
+      change.requested_kbps = request->configured_kbps;
+
+      // Only capture_async reads a change; encoder_supports_live_resize() tests PARALLEL_ENCODING
+      if (auto refusal = adaptive_bitrate::check_request(session->config.monitor.input_only, video::encoder_supports_live_resize(), request->configured_kbps)) {
+        answer_bitrate(session, change, *refusal);
+        return;
+      }
+
+      auto chain = session->config.bitrate_chain;
+      chain.configured_kbps = request->configured_kbps;
+      const auto result = adaptive_bitrate::encoder_bitrate(chain);
+      change.accepted_kbps = (std::uint32_t) result.accepted_kbps;
+      change.encoder_kbps = (int) result.encoder_kbps;
+
+      std::optional<adaptive_bitrate::change_t> replaced;
+      if (session->bitrate.state.on_request(change, replaced)) {
+        answer_bitrate(session, change, adaptive_bitrate::status_e::unchanged);
+        return;
+      }
+      if (replaced) {
+        BOOST_LOG(debug) << "Bitrate request "sv << change.request_id << " replaces pending request "sv << replaced->request_id;
+      }
+    });
+
     server->map(packetTypes[IDX_ENCRYPTED], [server](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_ENCRYPTED]"sv;
 
@@ -1498,6 +1602,7 @@ namespace stream {
 
             // A pending resize request ends with its session; the client is gone
             session->resize.pending.clear();
+            session->bitrate.state.clear();
 
             session->controlEnd.raise(true);
             continue;
@@ -1621,6 +1726,27 @@ namespace stream {
                                    << " could not start in 60 s"sv;
                 send_resize_refused(session, (std::uint16_t) pending.width, (std::uint16_t) pending.height, pending.request_id, (std::uint16_t) live_resize::reason_e::busy);
                 break;
+            }
+
+            // Adaptive bitrate: answer the results, then release the next change. The state is
+            // in src/adaptive_bitrate.h.
+            auto &bitrate = session->bitrate;
+            while (session->control.peer && bitrate.result_queue->peek()) {
+              auto result = bitrate.result_queue->pop();
+              if (!result) {
+                continue;
+              }
+              bitrate.state.on_result(*result, now);
+              answer_bitrate(session, result->change, result->status);
+            }
+            if (bitrate.state.watchdog(now)) {
+              BOOST_LOG(warning) << "Bitrate request got no encoder result in 5 s, state cleared"sv;
+            }
+            // A live resize in progress takes the size at the next capture_async loop. A bitrate
+            // restart must not start that loop early (adaptive_bitrate::state_t::take_release()).
+            const bool resize_busy = resize.in_progress || resize.worker_id.load(std::memory_order_acquire) != 0;
+            if (auto change = bitrate.state.take_release(now, resize_busy)) {
+              bitrate.change_queue->raise(*change);
             }
           }
 
@@ -2842,6 +2968,13 @@ namespace stream {
       session->resize.size_queue = mail->event<std::pair<int, int>>(mail::resize);
       session->resize.refused_queue = mail->event<std::uint16_t>(mail::resize_refused);
       session->resize.done_queue = mail->event<bool>(mail::resize_done);
+
+      // The encoder starts at config.monitor.bitrate; the chain gives the accepted value of the start
+      session->bitrate.state = {};
+      session->bitrate.state.encoder_kbps = config.monitor.bitrate;
+      session->bitrate.state.accepted_kbps = (std::uint32_t) adaptive_bitrate::encoder_bitrate(config.bitrate_chain).accepted_kbps;
+      session->bitrate.change_queue = mail->event<adaptive_bitrate::change_t>(mail::bitrate);
+      session->bitrate.result_queue = mail->queue<adaptive_bitrate::result_t>(mail::bitrate_result);
 
       session->mail = std::move(mail);
 
