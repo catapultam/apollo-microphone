@@ -394,9 +394,8 @@ of these items were not tested on Windows.
    - `type C:\ProgramData\ApolloUpdate\logs\ApolloUpdate.log` works.
 3. Signature on Windows PowerShell 5.1 (the `RSACng` path): run
    `ApolloUpdate.ps1 -CheckOnly` elevated. The log must show
-   `valid signature` for the release. Change one byte of a downloaded
-   manifest copy and verify with the functions, or publish nothing and
-   confirm that a release without a valid signature gives exit 5.
+   `valid signature` for the release. Then run it with a channel that has
+   no signed release (for example `-Channel nothing`): exit 5.
 4. Full update with `ApolloUpdateNow`: the log must show the installer
    exit code 0, `Healthy`, `Stable`, exit 0. Examine that the service and
    the firewall rules exist after the update.

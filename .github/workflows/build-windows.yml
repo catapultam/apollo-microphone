@@ -6,7 +6,7 @@ permissions:
 # ci-windows.yml that commit da5a4e3e removed: build and package steps only.
 # The publish job signs a release manifest and puts the installer in a
 # prerelease for scripts/updater/ApolloUpdate.ps1. It runs only for the
-# branches in PUBLISH_BRANCHES. The "release" environment holds the signing
+# branches in the "if:" list of that job. The "release" environment holds the signing
 # key and has the same branch rule.
 on:
   workflow_dispatch:
