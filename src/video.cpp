@@ -2469,6 +2469,11 @@ namespace video {
     }
   }
 
+  bool encoder_supports_live_resize() {
+    auto encoder = chosen_encoder;
+    return encoder && (encoder->flags & PARALLEL_ENCODING);
+  }
+
   void capture(
     safe::mail_t mail,
     config_t config,

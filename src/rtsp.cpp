@@ -27,6 +27,7 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "process.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
@@ -789,6 +790,13 @@ namespace rtsp_stream {
 
     // Tell the client about our supported features
     ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
+
+#ifdef _WIN32
+    // Live resize needs the SudoVDA driver (Apollo live resize extension)
+    if (proc::vDisplayDriverStatus == VDISPLAY::DRIVER_STATUS::OK) {
+      ss << "a=x-ss-general.liveResize:1"sv << std::endl;
+    }
+#endif
 
     // Always request new control stream encryption if the client supports it
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;

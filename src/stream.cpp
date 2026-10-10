@@ -4,6 +4,7 @@
  */
 
 // standard includes
+#include <cstring>
 #include <fstream>
 #include <future>
 #include <queue>
@@ -34,7 +35,9 @@ extern "C" {
 #include "logging.h"
 #include "network.h"
 #include "platform/common.h"
+#include "live_resize.h"
 #include "process.h"
+#include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
 #include "system_tray.h"
@@ -59,6 +62,8 @@ extern "C" {
 #define IDX_SET_CLIPBOARD 16
 #define IDX_FILE_TRANSFER_NONCE_REQUEST 17
 #define IDX_SET_ADAPTIVE_TRIGGERS 18
+#define IDX_RESIZE_REQUEST 19
+#define IDX_RESIZE_REFUSED 20
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -80,7 +85,12 @@ static const short packetTypes[] = {
   0x3001,  // Set Clipboard (Apollo protocol extension)
   0x3002,  // File transfer nonce request (Apollo protocol extension)
   0x5503,  // Set Adaptive triggers (Sunshine protocol extension)
+  0x3100,  // Resize request (Apollo live resize extension)
+  0x3101,  // Resize refused (Apollo live resize extension)
 };
+
+static_assert(packetTypes[IDX_RESIZE_REQUEST] == (short) live_resize::PACKET_TYPE_REQUEST, "RESIZE_REQUEST id must match live_resize.h");
+static_assert(packetTypes[IDX_RESIZE_REFUSED] == (short) live_resize::PACKET_TYPE_REFUSED, "RESIZE_REFUSED id must match live_resize.h");
 
 namespace asio = boost::asio;
 namespace sys = boost::system;
@@ -251,6 +261,12 @@ namespace stream {
     boost::endian::little_uint16_at sequenceNumber;
     boost::endian::little_uint32_at timestamp;
     boost::endian::little_uint32_at ssrc;
+  };
+
+  struct control_resize_refused_t {
+    control_header_v2 header;
+
+    live_resize::refused_payload_t payload;
   };
 
 #pragma pack(pop)
@@ -429,6 +445,23 @@ namespace stream {
       platf::feedback_queue_t feedback_queue;
       safe::mail_raw_t::event_t<video::hdr_info_t> hdr_queue;
     } control;
+
+    // Live resize state (see src/live_resize.h). Only the control thread uses the plain
+    // fields. Display threads use worker_id and the queues.
+    struct {
+      std::atomic<bool> in_progress {false};  ///< Set by the handler, cleared by the control thread
+      bool done_seen = false;  ///< An encoder started after the request
+      std::atomic<std::uint32_t> worker_id {0};  ///< Id of the running display thread, 0 when none
+      int width = 0;  ///< Size the host targets now; the control thread writes it
+      int height = 0;
+      int last_width = 0;  ///< Size before the pending request, for the revert
+      int last_height = 0;
+      std::uint32_t request_id = 0;
+      std::chrono::steady_clock::time_point started;
+      safe::mail_raw_t::event_t<std::pair<int, int>> size_queue;  ///< New size for capture_async
+      safe::mail_raw_t::event_t<std::uint16_t> refused_queue;  ///< Reason from a display thread or capture_async
+      safe::mail_raw_t::event_t<bool> done_queue;  ///< Raised by encode_run at each encoder start
+    } resize;
 
     std::uint32_t launch_session_id;
     std::string device_name;
@@ -946,6 +979,160 @@ namespace stream {
     return 0;
   }
 
+  /**
+   * @brief Send RESIZE_REFUSED to the client.
+   * @details Only the control thread may call this, because ENet is not thread safe.
+   */
+  int send_resize_refused(session_t *session, std::uint16_t width, std::uint16_t height, std::uint32_t request_id, std::uint16_t reason) {
+    if (!session->control.peer) {
+      BOOST_LOG(warning) << "Couldn't send resize refusal, still waiting for PING from Moonlight"sv;
+      return -1;
+    }
+
+    control_resize_refused_t plaintext {};
+    plaintext.header.type = packetTypes[IDX_RESIZE_REFUSED];
+    plaintext.header.payloadLength = sizeof(live_resize::refused_payload_t);
+    plaintext.payload.width = width;
+    plaintext.payload.height = height;
+    plaintext.payload.request_id = request_id;
+    plaintext.payload.reason = reason;
+
+    std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
+      encrypted_payload;
+
+    auto payload = encode_control(session, util::view(plaintext), encrypted_payload);
+    if (session->broadcast_ref->control_server.send(payload, session->control.peer)) {
+      TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
+      BOOST_LOG(warning) << "Couldn't send resize refusal to ["sv << addr << ':' << port << ']';
+
+      return -1;
+    }
+
+    BOOST_LOG(warning) << "Refused resize request "sv << request_id << " to "sv << width << 'x' << height << " with reason "sv << reason;
+    return 0;
+  }
+
+#ifdef _WIN32
+  /**
+   * @brief Make a new id for a live resize display thread.
+   * @return An id that is not zero and is unique across sessions until it wraps.
+   */
+  static std::uint32_t next_resize_worker_id() {
+    static std::atomic<std::uint32_t> counter {0};
+    std::uint32_t id;
+    do {
+      id = ++counter;
+    } while (id == 0);
+    return id;
+  }
+
+  /**
+   * @brief Get the session of a live resize display thread.
+   * @details The session uuid is the client id, thus a reconnected client has the same uuid.
+   * The worker id tells the sessions apart. Do not call this on the control thread:
+   * find_session() locks the RTSP session list, and the RTSP thread can hold that lock while
+   * it waits for the control thread.
+   * @return The session, or nullptr when it ended or another display thread owns it.
+   */
+  static std::shared_ptr<session_t> find_resize_owner(const std::string &session_uuid, std::uint32_t worker_id) {
+    auto session = rtsp_stream::find_session(session_uuid);
+    if (session && session->resize.worker_id.load(std::memory_order_acquire) == worker_id) {
+      return session;
+    }
+    return nullptr;
+  }
+
+  /**
+   * @brief Tell the control thread that a live resize display thread is finished.
+   */
+  static void release_resize_worker(const std::string &session_uuid, std::uint32_t worker_id) {
+    if (auto session = find_resize_owner(session_uuid, worker_id)) {
+      auto expected = worker_id;
+      session->resize.worker_id.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+    }
+  }
+
+  /**
+   * @brief Change the virtual display for a resize request, off the control thread.
+   * @details Keeps only the session uuid and the worker id. On failure, reverts the display
+   * and queues DISPLAY_FAILED. When the revert also fails, the session has no display and
+   * the stream stops.
+   */
+  static void live_resize_worker(std::string session_uuid, std::uint32_t worker_id, int width, int height, int old_width, int old_height) {
+    auto release = util::fail_guard([&]() {
+      release_resize_worker(session_uuid, worker_id);
+    });
+
+    // The session can end between the request and this point. Then another app can own the display.
+    if (!find_resize_owner(session_uuid, worker_id)) {
+      BOOST_LOG(warning) << "Live resize to "sv << width << 'x' << height << " not done: the session ended"sv;
+      return;
+    }
+
+    auto result = live_resize::change_display_size(width, height);
+    if (result.ok) {
+      // The capture thread sees the display loss and reinitializes with the new size
+      return;
+    }
+
+    BOOST_LOG(warning) << "Live resize to "sv << width << 'x' << height << " failed: "sv << result.message;
+
+    // When no app with a virtual display runs, nothing changed and there is nothing to revert
+    const bool display_changed = result.message != "no app with a virtual display runs"sv;
+
+    auto session = find_resize_owner(session_uuid, worker_id);
+    if (session) {
+      // Do this before the revert: the revert causes the reinit at which capture_async reads
+      // the mail. Take the new size back if capture_async did not read it, else give it the old size.
+      if (!session->resize.size_queue->pop(0ms)) {
+        session->resize.size_queue->raise(std::make_pair(old_width, old_height));
+      }
+    }
+
+    // Revert also when the session ended: the app can still run and needs its display
+    bool revert_ok = true;
+    if (display_changed) {
+      auto revert = live_resize::change_display_size(old_width, old_height);
+      revert_ok = revert.ok;
+      if (!revert_ok) {
+        BOOST_LOG(error) << "Live resize: revert to "sv << old_width << 'x' << old_height << " failed: "sv << revert.message;
+      }
+    }
+
+    if (!session) {
+      return;
+    }
+
+    session->resize.refused_queue->raise((std::uint16_t) live_resize::reason_e::display_failed);
+
+    if (!revert_ok) {
+      BOOST_LOG(error) << "Live resize: the session has no display, stopping the stream"sv;
+      session::stop(*session);
+    }
+  }
+
+  /**
+   * @brief Set the virtual display back to the old size after the encoder rejected the new size.
+   * @details capture_async already went back to the old size. When the change fails, the
+   * session has no display and the stream stops.
+   */
+  static void live_resize_revert_worker(std::string session_uuid, std::uint32_t worker_id, int width, int height) {
+    auto release = util::fail_guard([&]() {
+      release_resize_worker(session_uuid, worker_id);
+    });
+
+    auto result = live_resize::change_display_size(width, height);
+    if (result.ok) {
+      return;
+    }
+
+    BOOST_LOG(error) << "Live resize: revert after encoder failure to "sv << width << 'x' << height << " failed: "sv << result.message;
+    if (auto session = find_resize_owner(session_uuid, worker_id)) {
+      session::stop(*session);
+    }
+  }
+#endif
+
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
@@ -1069,6 +1256,104 @@ namespace stream {
         BOOST_LOG(debug) << "Permission File Upload deined for [" << session->device_name << "]";
         return;
       }
+    });
+
+    server->map(packetTypes[IDX_RESIZE_REQUEST], [](session_t *session, const std::string_view &payload) {
+      BOOST_LOG(debug) << "type [IDX_RESIZE_REQUEST]"sv;
+
+      if (payload.size() < sizeof(live_resize::request_payload_t)) {
+        BOOST_LOG(warning) << "Resize request: runt payload of "sv << payload.size() << " bytes"sv;
+        return;
+      }
+
+      live_resize::request_payload_t request;
+      std::memcpy(&request, payload.data(), sizeof(request));
+      const int width = request.width;
+      const int height = request.height;
+      const std::uint32_t request_id = request.request_id;
+
+      auto refuse = [&](live_resize::reason_e reason) {
+        send_resize_refused(session, (std::uint16_t) width, (std::uint16_t) height, request_id, (std::uint16_t) reason);
+      };
+
+      auto &resize = session->resize;
+
+      if (width == resize.width && height == resize.height) {
+        BOOST_LOG(debug) << "Resize request to the current size "sv << width << 'x' << height << ", ignored"sv;
+        return;
+      }
+
+      // A display thread that still runs also makes the host busy
+      if (resize.in_progress || resize.worker_id.load(std::memory_order_acquire) != 0) {
+        refuse(live_resize::reason_e::busy);
+        return;
+      }
+
+#ifdef _WIN32
+      if (!proc::proc.virtual_display || proc::vDisplayDriverStatus != VDISPLAY::DRIVER_STATUS::OK) {
+        refuse(live_resize::reason_e::not_virtual_display);
+        return;
+      }
+
+      // Only capture_async reads the new size. The sync capture path cannot follow a resize.
+      if (!video::encoder_supports_live_resize()) {
+        refuse(live_resize::reason_e::encoder_failed);
+        return;
+      }
+
+      // One virtual display and one capture thread serve all sessions; a resize changes the
+      // picture for the others. Do not use rtsp_stream::session_count() here: it joins
+      // stopped sessions, which wait for this thread.
+      if (session::running_sessions.load(std::memory_order_acquire) > 1) {
+        refuse(live_resize::reason_e::multiple_clients);
+        return;
+      }
+
+      auto size_check = live_resize::validate_size(width, height, session->config.monitor.videoFormat, session->config.monitor.input_only);
+      if (size_check != live_resize::reason_e::ok) {
+        refuse(size_check);
+        return;
+      }
+
+      // Results from before this request must not count for it
+      resize.done_queue->pop(0ms);
+      resize.refused_queue->pop(0ms);
+
+      const auto worker_id = next_resize_worker_id();
+      resize.worker_id.store(worker_id, std::memory_order_release);
+      resize.in_progress = true;
+      resize.done_seen = false;
+      resize.started = std::chrono::steady_clock::now();
+      resize.request_id = request_id;
+      resize.last_width = resize.width;
+      resize.last_height = resize.height;
+      resize.width = width;
+      resize.height = height;
+
+      // capture_async reads this at its next reinit, which the display change causes.
+      // The encoder and the virtual display both get the size that the client asked for.
+      // The scale factor of the app or the launch applies only at launch.
+      resize.size_queue->raise(std::make_pair(width, height));
+
+      BOOST_LOG(info) << "Resize request "sv << request_id << " from ["sv << session->device_name
+                      << "] from "sv << resize.last_width << 'x' << resize.last_height << " to "sv << width << 'x' << height;
+
+      // The display change takes up to seconds; it must not block the control thread
+      try {
+        std::thread worker(live_resize_worker, session::uuid(*session), worker_id, width, height, resize.last_width, resize.last_height);
+        worker.detach();
+      } catch (const std::system_error &e) {
+        BOOST_LOG(warning) << "Live resize: couldn't start the display thread: "sv << e.what();
+        resize.size_queue->pop(0ms);
+        resize.width = resize.last_width;
+        resize.height = resize.last_height;
+        resize.in_progress = false;
+        resize.worker_id.store(0, std::memory_order_release);
+        refuse(live_resize::reason_e::display_failed);
+      }
+#else
+      refuse(live_resize::reason_e::not_virtual_display);
+#endif
     });
 
     server->map(packetTypes[IDX_ENCRYPTED], [server](session_t *session, const std::string_view &payload) {
@@ -1201,6 +1486,62 @@ namespace stream {
               auto hdr_info = hdr_queue->pop();
 
               send_hdr_mode(session, std::move(hdr_info));
+            }
+
+            // Live resize results. Refusals first: a refusal and an encoder start can be
+            // pending together after an encoder failure, and the refusal must win.
+            auto &resize = session->resize;
+            while (session->control.peer && resize.refused_queue->peek()) {
+              auto reason = resize.refused_queue->pop();
+              if (!reason || !resize.in_progress) {
+                continue;
+              }
+
+              send_resize_refused(session, (std::uint16_t) resize.width, (std::uint16_t) resize.height, resize.request_id, *reason);
+              resize.width = resize.last_width;
+              resize.height = resize.last_height;
+              resize.in_progress = false;
+
+#ifdef _WIN32
+              if (*reason == (std::uint16_t) live_resize::reason_e::encoder_failed) {
+                // capture_async went back to the old size; put the display back too.
+                // The worker id makes the host busy until this is done.
+                const auto worker_id = next_resize_worker_id();
+                resize.worker_id.store(worker_id, std::memory_order_release);
+                try {
+                  std::thread revert(live_resize_revert_worker, session::uuid(*session), worker_id, resize.width, resize.height);
+                  revert.detach();
+                } catch (const std::system_error &e) {
+                  BOOST_LOG(error) << "Live resize: couldn't start the display revert thread: "sv << e.what();
+                  resize.worker_id.store(0, std::memory_order_release);
+                }
+              }
+#endif
+            }
+
+            while (resize.done_queue->peek()) {
+              resize.done_queue->pop();
+              if (resize.in_progress) {
+                resize.done_seen = true;
+              }
+            }
+
+            // Done when an encoder started after the request and the display thread is finished
+            if (resize.in_progress && resize.done_seen && resize.worker_id.load(std::memory_order_acquire) == 0) {
+              BOOST_LOG(info) << "Resize request "sv << resize.request_id << " done: encoder runs at "sv << resize.width << 'x' << resize.height;
+              resize.in_progress = false;
+            }
+
+            if (resize.in_progress && now - resize.started > live_resize::HOST_TIMEOUT) {
+              // Watchdog: a lost result must not block the session. When capture_async did
+              // not read the new size, take it back, so that a later reinit does not apply it.
+              if (resize.size_queue->pop(0ms)) {
+                resize.width = resize.last_width;
+                resize.height = resize.last_height;
+              }
+              BOOST_LOG(warning) << "Resize request "sv << resize.request_id << " did not finish in time, state cleared, size is "sv
+                                 << resize.width << 'x' << resize.height;
+              resize.in_progress = false;
             }
           }
 
@@ -2403,6 +2744,18 @@ namespace stream {
 
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);
+
+      session->resize.in_progress = false;
+      session->resize.done_seen = false;
+      session->resize.worker_id = 0;
+      session->resize.width = config.monitor.width;
+      session->resize.height = config.monitor.height;
+      session->resize.last_width = config.monitor.width;
+      session->resize.last_height = config.monitor.height;
+      session->resize.request_id = 0;
+      session->resize.size_queue = mail->event<std::pair<int, int>>(mail::resize);
+      session->resize.refused_queue = mail->event<std::uint16_t>(mail::resize_refused);
+      session->resize.done_queue = mail->event<bool>(mail::resize_done);
 
       session->mail = std::move(mail);
 

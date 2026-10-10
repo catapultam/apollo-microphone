@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <atomic>
 #include <utility>
 
 // lib includes
@@ -54,6 +55,9 @@ namespace stream {
     int start(session_t &session, const std::string &addr_string);
     void stop(session_t &session);
     void graceful_stop(session_t& session);
+
+    // Number of sessions in state RUNNING, counted in start() and stop()
+    extern std::atomic_uint running_sessions;
     void join(session_t &session);
     state_e state(session_t &session);
     inline bool send(session_t& session, const std::string_view &payload);

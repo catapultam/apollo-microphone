@@ -350,6 +350,14 @@ namespace video {
   bool validate_encoder(encoder_t &encoder, bool expect_failure);
 
   /**
+   * @brief Check if the chosen encoder can follow a live resize.
+   * @details Only capture_async reads a new size, and only an encoder with
+   * PARALLEL_ENCODING uses capture_async.
+   * @return True if an encoder is chosen and it has PARALLEL_ENCODING.
+   */
+  bool encoder_supports_live_resize();
+
+  /**
    * @brief Check if we can allow probing for the encoders.
    * @return True if there should be no issues with the probing, false if we should prevent it.
    */
