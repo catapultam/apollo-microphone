@@ -740,7 +740,16 @@ function Restore-Backup {
                 throw "Zip entry is outside the install folder: $($e.FullName)"
             }
             $null = New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force
+            # ExtractToFile cannot replace a hidden or read-only file (access
+            # denied). Apollo has hidden files in config\credentials. Remove
+            # the attributes, extract, then set them again.
+            $attr = $null
+            if ([System.IO.File]::Exists($dest)) {
+                $attr = [System.IO.File]::GetAttributes($dest)
+                [System.IO.File]::SetAttributes($dest, [System.IO.FileAttributes]::Normal)
+            }
             [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $dest, $true)
+            if ($null -ne $attr) { [System.IO.File]::SetAttributes($dest, $attr) }
         }
     } finally {
         $zip.Dispose()

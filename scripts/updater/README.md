@@ -126,7 +126,9 @@ again a release that failed before. The nightly task does not.
     and the ports must stay for 30 s. A crash loop fails this check.
 13. Success: writes `data\state.json`, removes the download folder, exit 0.
 14. Failure: writes `data\failed\<tag>` and restores the backup: stop the
-    service, extract the zip over the install folder, copy the config back,
+    service, extract the zip over the install folder (the attributes of
+    hidden and read-only files are removed for the extraction and then set
+    again), copy the config back,
     `icacls /restore` of the config ACLs, run `delete-firewall-rule.bat` and
     `add-firewall-rule.bat`, and if `ApolloService` does not exist, run
     `install-service.bat` and `autostart-service.bat` from the restored
@@ -274,9 +276,15 @@ A rollback is a restore of a backup. Do not delete releases.
    foreach ($e in $a.Entries) { if ($e.Name) {
        $d = Join-Path 'C:\Program Files\Apollo' $e.FullName
        New-Item -ItemType Directory -Force (Split-Path $d) | Out-Null
-       [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $d, $true) } }
+       $t = $null
+       if ([IO.File]::Exists($d)) { $t = [IO.File]::GetAttributes($d); [IO.File]::SetAttributes($d, 'Normal') }
+       [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $d, $true)
+       if ($null -ne $t) { [IO.File]::SetAttributes($d, $t) } } }
    $a.Dispose()
    ```
+
+   The attribute steps are necessary: `ExtractToFile` cannot replace a
+   hidden or read-only file, and `config\credentials` has hidden files.
 
 3. Copy the config with the same timestamp back, and restore its ACLs:
 
