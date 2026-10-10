@@ -23,7 +23,7 @@ namespace live_resize {
 
   enum class reason_e : std::uint16_t {
     ok = 0,  ///< Not sent on the wire
-    busy = 1,  ///< A resize is in progress
+    busy = 1,  ///< A pending request could not start in time (PENDING_TIMEOUT)
     not_virtual_display = 2,  ///< The capture display is not a SudoVDA monitor
     multiple_clients = 3,  ///< Another session shares the display
     size_limit = 4,  ///< The size is odd, too small, too large, or the session is input only
@@ -79,6 +79,85 @@ namespace live_resize {
       return reason_e::size_limit;
     }
     return reason_e::ok;
+  }
+
+  /**
+   * @brief What the host does with a RESIZE_REQUEST.
+   */
+  enum class request_action_e {
+    ignore,  ///< The size is the size that the host targets now. Send no reply. Clear the pending slot.
+    start,  ///< Nothing is in progress. Check the request and start the change.
+    store_pending,  ///< A change is in progress. Keep the request in the pending slot (the latest request wins).
+  };
+
+  /**
+   * @brief Select the action for a RESIZE_REQUEST.
+   * @param busy True when a request is in progress or a display thread runs.
+   * @param target_width Size that the host targets now: the size of the request in progress,
+   * else the current stream size.
+   * @param target_height See target_width.
+   * @param width Requested width.
+   * @param height Requested height.
+   * @return The action.
+   * @details A request that is equal to the size in progress clears the pending slot,
+   * because it is the latest size that the client wants.
+   */
+  constexpr request_action_e decide_request(bool busy, int target_width, int target_height, int width, int height) {
+    if (width == target_width && height == target_height) {
+      return request_action_e::ignore;
+    }
+    return busy ? request_action_e::store_pending : request_action_e::start;
+  }
+
+  // The host refuses a pending request with BUSY when it cannot start in this time
+  constexpr auto PENDING_TIMEOUT = HOST_TIMEOUT * 4;
+
+  /**
+   * @brief One request that waits until the change in progress ends.
+   * @details Only the control thread uses it. A new request overwrites the old one.
+   * The time of the first store stays, thus a series of overwrites cannot keep the
+   * slot alive forever.
+   */
+  struct pending_slot_t {
+    bool set = false;
+    int width = 0;
+    int height = 0;
+    std::uint32_t request_id = 0;
+    std::chrono::steady_clock::time_point first_stored;
+
+    void store(int new_width, int new_height, std::uint32_t new_request_id, std::chrono::steady_clock::time_point now) {
+      if (!set) {
+        first_stored = now;
+      }
+      set = true;
+      width = new_width;
+      height = new_height;
+      request_id = new_request_id;
+    }
+
+    void clear() {
+      set = false;
+    }
+
+    /**
+     * @brief Check if the pending request waited too long.
+     * @param now Current time.
+     * @return True when the slot is set and the first store is older than PENDING_TIMEOUT.
+     */
+    bool expired(std::chrono::steady_clock::time_point now) const {
+      return set && now - first_stored > PENDING_TIMEOUT;
+    }
+  };
+
+  /**
+   * @brief Check if the control thread can start the pending request now.
+   * @param in_progress True when a request is in progress.
+   * @param worker_running True when a display thread runs (worker_id != 0).
+   * @param pending_set True when the pending slot is set.
+   * @return True when the slot is set and the change before it ended.
+   */
+  constexpr bool can_start_pending(bool in_progress, bool worker_running, bool pending_set) {
+    return pending_set && !in_progress && !worker_running;
   }
 
 #ifdef _WIN32
