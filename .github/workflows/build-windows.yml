@@ -118,7 +118,7 @@ jobs:
     # "release" environment.
     if: >-
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      contains(fromJSON('["master", "live-resize", "ci-updater"]'), github.ref_name)
+      contains(fromJSON('["master", "live-resize"]'), github.ref_name)
     runs-on: ubuntu-latest
     environment: release
     permissions:
