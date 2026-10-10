@@ -20,14 +20,14 @@ using adaptive_bitrate::status_e;
 namespace {
   // The inline code of cmd_announce (src/rtsp.cpp) before Task 5, without the logs.
   // encoder_bitrate() must give the same values.
-  std::pair<std::int64_t, std::int64_t> old_chain(std::int64_t configuredBitrateKbps, int max_bitrate, std::size_t warp_factor, int fec_percentage, bool high_quality, int channels) {
+  std::pair<std::int64_t, std::int64_t> old_chain(std::int64_t configuredBitrateKbps, int max_bitrate, std::size_t warp_factor, int fec_percentage, bool high_quality, int channels, bool limit_framerate) {
     if (max_bitrate > 0) {
       if (max_bitrate < configuredBitrateKbps) {
         configuredBitrateKbps = max_bitrate;
       }
     }
     const std::int64_t accepted = configuredBitrateKbps;
-    if (warp_factor >= 2) {
+    if (limit_framerate && warp_factor >= 2) {
       configuredBitrateKbps *= warp_factor;
     }
     if (configuredBitrateKbps) {
@@ -100,11 +100,13 @@ TEST(AdaptiveBitrateChain, EqualsTheOldInlineCode) {
         for (int fec : {0, 20, 90}) {
           for (bool high : {false, true}) {
             for (int channels : {2, 8}) {
-              adaptive_bitrate::chain_input_t input {configured, max_bitrate, warp, fec, high, channels};
-              const auto result = adaptive_bitrate::encoder_bitrate(input);
-              const auto old = old_chain(configured, max_bitrate, warp, fec, high, channels);
-              EXPECT_EQ(result.accepted_kbps, old.first) << configured << ' ' << max_bitrate << ' ' << warp << ' ' << fec << ' ' << high << ' ' << channels;
-              EXPECT_EQ(result.encoder_kbps, old.second) << configured << ' ' << max_bitrate << ' ' << warp << ' ' << fec << ' ' << high << ' ' << channels;
+              for (bool limit : {false, true}) {
+                adaptive_bitrate::chain_input_t input {configured, max_bitrate, warp, fec, high, channels, limit};
+                const auto result = adaptive_bitrate::encoder_bitrate(input);
+                const auto old = old_chain(configured, max_bitrate, warp, fec, high, channels, limit);
+                EXPECT_EQ(result.accepted_kbps, old.first) << configured << ' ' << max_bitrate << ' ' << warp << ' ' << fec << ' ' << high << ' ' << channels << ' ' << limit;
+                EXPECT_EQ(result.encoder_kbps, old.second) << configured << ' ' << max_bitrate << ' ' << warp << ' ' << fec << ' ' << high << ' ' << channels << ' ' << limit;
+              }
             }
           }
         }
@@ -123,6 +125,16 @@ TEST(AdaptiveBitrateChain, KnownValues) {
   result = adaptive_bitrate::encoder_bitrate({44000, 20000, 1, 20, true, 2});
   EXPECT_EQ(result.accepted_kbps, 20000);
   EXPECT_LT(result.encoder_kbps, 20000);
+}
+
+TEST(AdaptiveBitrateChain, WarpNeedsLimitFramerate) {
+  // rtsp.cpp applies the warp factor only when config::video.limit_framerate is set
+  const auto no_limit = adaptive_bitrate::encoder_bitrate({20000, 0, 2, 20, true, 2, false});
+  const auto no_warp = adaptive_bitrate::encoder_bitrate({20000, 0, 1, 20, true, 2, true});
+  const auto warp = adaptive_bitrate::encoder_bitrate({20000, 0, 2, 20, true, 2, true});
+  EXPECT_EQ(no_limit.encoder_kbps, no_warp.encoder_kbps);
+  EXPECT_GT(warp.encoder_kbps, no_warp.encoder_kbps);
+  EXPECT_EQ(warp.accepted_kbps, 20000);
 }
 
 TEST(AdaptiveBitrateRequest, Refusals) {
@@ -262,4 +274,92 @@ TEST(AdaptiveBitrateState, ClearDropsPendingAndInFlight) {
   state.clear();
   EXPECT_FALSE(state.pending.has_value());
   EXPECT_FALSE(state.in_flight.has_value());
+}
+
+TEST(AdaptiveBitrateState, LateResultAfterWatchdogReappliesTheToldValue) {
+  // Request 1 restarts for more than 5 s and the watchdog clears it. Request 2 asks for the
+  // running value and gets UNCHANGED. Then the late result of request 1 changes the encoder.
+  // The state must queue the value that the client got for request 2.
+  auto state = started_state();
+  const auto t0 = std::chrono::steady_clock::now();
+  std::optional<change_t> replaced;
+  state.on_request(make_change(1, 20000), replaced);
+  state.take_release(t0, false);
+  EXPECT_TRUE(state.watchdog(t0 + 5001ms));
+  EXPECT_TRUE(state.on_request(make_change(2, 30000), replaced));
+
+  EXPECT_FALSE(state.on_result({make_change(1, 20000), status_e::applied_restart}, t0 + 6s));
+  EXPECT_EQ(state.encoder_kbps, 20000);
+  ASSERT_TRUE(state.pending.has_value());
+  EXPECT_EQ(state.pending->request_id, 2u);
+  EXPECT_EQ(state.pending->encoder_kbps, 30000);
+  EXPECT_EQ(state.pending->accepted_kbps, 40000u);  // UNCHANGED gave the running values
+
+  // The restart interval applies to the re-apply
+  EXPECT_FALSE(state.take_release(t0 + 7s, false).has_value());
+  auto released = state.take_release(t0 + 8s, false);
+  ASSERT_TRUE(released.has_value());
+  EXPECT_EQ(released->encoder_kbps, 30000);
+  EXPECT_TRUE(state.on_result({*released, status_e::applied_restart}, t0 + 9s));
+  EXPECT_EQ(state.encoder_kbps, 30000);
+  EXPECT_FALSE(state.pending.has_value());
+}
+
+TEST(AdaptiveBitrateState, LateResultWithoutAnAnswerReappliesTheStartValue) {
+  // No answer before: the client knows only the start value
+  auto state = started_state();
+  const auto t0 = std::chrono::steady_clock::now();
+  std::optional<change_t> replaced;
+  state.on_request(make_change(1, 20000), replaced);
+  state.take_release(t0, false);
+  EXPECT_TRUE(state.watchdog(t0 + 5001ms));
+  EXPECT_FALSE(state.on_result({make_change(1, 20000), status_e::applied}, t0 + 6s));
+  ASSERT_TRUE(state.pending.has_value());
+  EXPECT_EQ(state.pending->encoder_kbps, 30000);
+  EXPECT_EQ(state.pending->accepted_kbps, 40000u);
+}
+
+TEST(AdaptiveBitrateState, NewerRequestReplacesTheReapply) {
+  auto state = started_state();
+  const auto t0 = std::chrono::steady_clock::now();
+  std::optional<change_t> replaced;
+  state.on_request(make_change(1, 20000), replaced);
+  state.take_release(t0, false);
+  state.watchdog(t0 + 5001ms);
+  state.on_request(make_change(2, 30000), replaced);
+  state.on_result({make_change(1, 20000), status_e::applied_restart}, t0 + 6s);
+  ASSERT_TRUE(state.pending.has_value());
+
+  EXPECT_FALSE(state.on_request(make_change(3, 25000), replaced));
+  ASSERT_TRUE(replaced.has_value());
+  EXPECT_EQ(replaced->request_id, 2u);
+  EXPECT_EQ(state.pending->request_id, 3u);
+}
+
+TEST(AdaptiveBitrateState, NoReapplyWhileANewerRequestWaits) {
+  auto state = started_state();
+  const auto t0 = std::chrono::steady_clock::now();
+  std::optional<change_t> replaced;
+  state.on_request(make_change(1, 20000), replaced);
+  state.take_release(t0, false);
+  state.watchdog(t0 + 5001ms);
+  state.on_request(make_change(2, 15000), replaced);
+  state.take_release(t0 + 5100ms, false);
+  // The late result of request 1 must not replace request 2 in flight
+  EXPECT_FALSE(state.on_result({make_change(1, 20000), status_e::applied}, t0 + 5200ms));
+  EXPECT_FALSE(state.pending.has_value());
+  ASSERT_TRUE(state.in_flight.has_value());
+  EXPECT_EQ(state.in_flight->request_id, 2u);
+}
+
+TEST(AdaptiveBitrateState, LateResultEqualToTheToldValueQueuesNothing) {
+  auto state = started_state();
+  const auto t0 = std::chrono::steady_clock::now();
+  std::optional<change_t> replaced;
+  state.on_request(make_change(1, 30000 + 1), replaced);
+  state.take_release(t0, false);
+  state.watchdog(t0 + 5001ms);
+  // An encoder_failed result does not change the encoder
+  EXPECT_FALSE(state.on_result({make_change(1, 30001), status_e::encoder_failed}, t0 + 6s));
+  EXPECT_FALSE(state.pending.has_value());
 }

@@ -137,6 +137,7 @@ namespace adaptive_bitrate {
     int fec_percentage = 20;  ///< config::stream.fec_percentage
     bool audio_high_quality = true;  ///< audio::config_t::HIGH_QUALITY
     int audio_channels = 2;
+    bool limit_framerate = true;  ///< config::video.limit_framerate. The warp factor applies only when true.
   };
 
   struct chain_result_t {
@@ -147,7 +148,7 @@ namespace adaptive_bitrate {
   /**
    * @brief Convert a configured bitrate to the encoder bitrate.
    * @details The steps of cmd_announce in the same order: cap at max_bitrate, multiply by
-   * the warp factor, remove the FEC share (when fec_percentage <= 80), subtract the audio
+   * the warp factor (only when limit_framerate is true), remove the FEC share (when fec_percentage <= 80), subtract the audio
    * bitrate (at most 20 %), subtract 500 kbps for packet overhead (at most 10 %).
    * The stream start and the SET_BITRATE handler both use this function, thus they agree.
    */
@@ -158,7 +159,7 @@ namespace adaptive_bitrate {
     }
     const std::int64_t accepted = kbps;
 
-    if (input.warp_factor >= 2) {
+    if (input.limit_framerate && input.warp_factor >= 2) {
       kbps *= input.warp_factor;
     }
 
@@ -223,6 +224,10 @@ namespace adaptive_bitrate {
     std::chrono::steady_clock::time_point in_flight_since;
     bool restart_mode = false;  ///< Set after the first encoder restart for a change
     std::chrono::steady_clock::time_point last_restart;
+    /// Values of the newest answer that the client uses (UNCHANGED, or the result of the
+    /// request in flight). No value before the first answer: the client then knows only
+    /// the start values.
+    std::optional<change_t> told;
 
     /**
      * @brief Accept a checked request (spec 5.2 steps 7 and 8).
@@ -234,6 +239,7 @@ namespace adaptive_bitrate {
     bool on_request(const change_t &change, std::optional<change_t> &replaced) {
       replaced.reset();
       if (change.encoder_kbps == encoder_kbps && !pending && !in_flight) {
+        told = change_t {change.request_id, encoder_kbps, change.requested_kbps, accepted_kbps};
         return true;
       }
       replaced = pending;
@@ -245,8 +251,16 @@ namespace adaptive_bitrate {
      * @brief Apply a result from the encode thread (spec 5.3 step 1).
      * @return True when the result is for the request in flight, which then ends.
      * A result for an older request leaves in_flight set.
+     * @details A result can come after the watchdog cleared its request. Then the client
+     * uses the values of a later answer, but the encoder can run at a different value.
+     * When no request waits or is in flight, the function stores the told values in
+     * pending, thus the encoder goes back to the value that the client uses. A newer
+     * request replaces this re-apply as any pending request.
      */
     bool on_result(const result_t &result, std::chrono::steady_clock::time_point now) {
+      if (!told) {
+        told = change_t {0, encoder_kbps, accepted_kbps, accepted_kbps};
+      }
       switch (result.status) {
         case status_e::applied_restart:
           restart_mode = true;
@@ -269,7 +283,11 @@ namespace adaptive_bitrate {
       }
       if (in_flight && in_flight->request_id == result.change.request_id) {
         in_flight.reset();
+        told = change_t {result.change.request_id, encoder_kbps, result.change.requested_kbps, accepted_kbps};
         return true;
+      }
+      if (!pending && !in_flight && encoder_kbps != told->encoder_kbps) {
+        pending = told;
       }
       return false;
     }
@@ -314,6 +332,7 @@ namespace adaptive_bitrate {
     void clear() {
       pending.reset();
       in_flight.reset();
+      told.reset();
     }
   };
 
