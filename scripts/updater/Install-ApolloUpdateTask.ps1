@@ -47,7 +47,7 @@
 param(
     [ValidatePattern('^[A-Za-z0-9._/-]+$')]
     [string]$Channel = 'master',
-    [string]$SourceScript = (Join-Path $PSScriptRoot 'ApolloUpdate.ps1'),
+    [string]$SourceScript = '',
     [string]$At = '04:00',
     [switch]$ResetState
 )
@@ -122,6 +122,9 @@ function Set-Folder {
     }
 }
 
+# Windows PowerShell 5.1 with [CmdletBinding()] gives an empty
+# $PSScriptRoot in a parameter default. Thus set the default here.
+if (-not $SourceScript) { $SourceScript = Join-Path $PSScriptRoot 'ApolloUpdate.ps1' }
 if (-not (Test-Path -LiteralPath $SourceScript)) { throw "Cannot find $SourceScript" }
 $sourceHash = (Get-FileHash -LiteralPath $SourceScript -Algorithm SHA256).Hash
 
