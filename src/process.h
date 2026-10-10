@@ -232,8 +232,9 @@ namespace proc {
    * A live resize holds it for up to about 2.5 s of name polling (about 1.26 s for each of two
    * adds) plus up to four mode changes (one or two after each add, two when
    * isolated_virtual_display_option is set), which have no time limit. terminate() waits for
-   * the current step only (see vdd_generation). Do not call proc_t::running() while you hold it: running() can
-   * call terminate(), which locks it again.
+   * at most one remove and one add (about 1.26 s), or for one mode change (see vdd_generation).
+   * Do not call proc_t::running() while you hold it: running() can call terminate(), which
+   * locks it again.
    */
   extern std::mutex vdd_lock;
 
@@ -241,9 +242,10 @@ namespace proc {
    * @brief Identity of the virtual display of the running app, 0 when there is none.
    * @details execute() sets a new value under vdd_lock when it creates the display.
    * terminate() sets 0 before it waits for vdd_lock, and again under the lock. Thus a live
-   * resize that holds the lock sees the change between its steps and stops early, and
-   * terminate() waits only for the step that runs. A live resize records the value at the
-   * request and changes or reverts the display only while the value is the same.
+   * resize that holds the lock sees the change after each add and each mode change and stops
+   * early. No check follows a remove, thus terminate() waits for at most one remove and one
+   * add, or for one mode change. A live resize records the value at the request and changes
+   * or reverts the display only while the value is the same.
    * Read it without the lock.
    */
   extern std::atomic<std::uint32_t> vdd_generation;

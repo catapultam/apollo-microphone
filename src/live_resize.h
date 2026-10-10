@@ -32,6 +32,7 @@ namespace live_resize {
     // 7 (not supported) is used by the client only
   };
 
+  // Payloads are little endian on the wire. Use util::endian::little() to read and write them.
 #pragma pack(push, 1)
   struct request_payload_t {
     std::uint16_t width;
@@ -123,7 +124,9 @@ namespace live_resize {
    * when config::video.isolated_virtual_display_option is set), thus up to four. The mode
    * changes have no time limit. proc_t::terminate() sets proc::vdd_generation to 0 before
    * it waits for the lock. This function checks the value after each add and each mode
-   * change and stops, thus terminate() waits for one add (about 1.26 s) or one mode change.
+   * change, and then stops. No check follows a remove: each remove comes before an add with
+   * no check between them. Thus terminate() waits for at most one remove and one add (about
+   * 1.26 s of name polling), or for one mode change.
    * A mode change that does not return still blocks terminate(). stream::session::join()
    * can call terminate() inside its 10 s hang check, which then ends Apollo.
    */

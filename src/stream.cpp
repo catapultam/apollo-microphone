@@ -985,10 +985,11 @@ namespace stream {
     control_resize_refused_t plaintext {};
     plaintext.header.type = packetTypes[IDX_RESIZE_REFUSED];
     plaintext.header.payloadLength = sizeof(live_resize::refused_payload_t);
-    plaintext.payload.width = width;
-    plaintext.payload.height = height;
-    plaintext.payload.request_id = request_id;
-    plaintext.payload.reason = reason;
+    // The payload is little endian on the wire; convert it explicitly
+    plaintext.payload.width = util::endian::little(width);
+    plaintext.payload.height = util::endian::little(height);
+    plaintext.payload.request_id = util::endian::little(request_id);
+    plaintext.payload.reason = util::endian::little(reason);
 
     std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
       encrypted_payload;
@@ -1262,11 +1263,12 @@ namespace stream {
         return;
       }
 
+      // The payload is little endian on the wire; convert it explicitly
       live_resize::request_payload_t request;
       std::memcpy(&request, payload.data(), sizeof(request));
-      const int width = request.width;
-      const int height = request.height;
-      const std::uint32_t request_id = request.request_id;
+      const int width = util::endian::little(request.width);
+      const int height = util::endian::little(request.height);
+      const std::uint32_t request_id = util::endian::little(request.request_id);
 
       auto refuse = [&](live_resize::reason_e reason) {
         send_resize_refused(session, (std::uint16_t) width, (std::uint16_t) height, request_id, (std::uint16_t) reason);
@@ -1551,8 +1553,9 @@ namespace stream {
                 BOOST_LOG(warning) << "Resize request "sv << resize.request_id << " did not finish in time, state cleared, size is "sv
                                    << resize.width << 'x' << resize.height;
               } else if (now - resize.started > live_resize::HOST_TIMEOUT * 4) {
-                // capture_async read the size but started no encoder. A result after this
-                // point is dropped, and the next request drains it.
+                // capture_async read the size but started no encoder. A late result that
+                // comes while no request is in progress is dropped. A late result that comes
+                // after the next request starts counts as the result of that request.
                 resize.in_progress = false;
                 BOOST_LOG(warning) << "Resize request "sv << resize.request_id << " got no encoder result in time, state cleared, size is "sv
                                    << resize.width << 'x' << resize.height;
