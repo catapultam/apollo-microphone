@@ -982,7 +982,7 @@ namespace stream {
    */
   int send_resize_refused(session_t *session, std::uint16_t width, std::uint16_t height, std::uint32_t request_id, std::uint16_t reason) {
     if (!session->control.peer) {
-      BOOST_LOG(warning) << "Couldn't send resize refusal, still waiting for PING from Moonlight"sv;
+      BOOST_LOG(warning) << "Could not send resize refusal, still waiting for PING from Moonlight"sv;
       return -1;
     }
 
@@ -1000,7 +1000,7 @@ namespace stream {
     auto payload = encode_control(session, util::view(plaintext), encrypted_payload);
     if (session->broadcast_ref->control_server.send(payload, session->control.peer)) {
       TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
-      BOOST_LOG(warning) << "Couldn't send resize refusal to ["sv << addr << ':' << port << ']';
+      BOOST_LOG(warning) << "Could not send resize refusal to ["sv << addr << ':' << port << ']';
 
       return -1;
     }
@@ -1103,7 +1103,7 @@ namespace stream {
     session->resize.refused_queue->raise((std::uint16_t) live_resize::reason_e::display_failed);
 
     if (!revert_ok) {
-      BOOST_LOG(error) << "Live resize: the session has no display, stopping the stream"sv;
+      BOOST_LOG(error) << "Live resize: the session has no display, the stream stops"sv;
       session::stop(*session);
     }
   }
@@ -1340,7 +1340,7 @@ namespace stream {
         std::thread worker(live_resize_worker, session::uuid(*session), worker_id, width, height, resize.last_width, resize.last_height);
         worker.detach();
       } catch (const std::system_error &e) {
-        BOOST_LOG(warning) << "Live resize: couldn't start the display thread: "sv << e.what();
+        BOOST_LOG(warning) << "Live resize: could not start the display thread: "sv << e.what();
         resize.size_queue->pop(0ms);
         resize.width = resize.last_width;
         resize.height = resize.last_height;
@@ -1509,7 +1509,7 @@ namespace stream {
                   std::thread revert(live_resize_revert_worker, session::uuid(*session), worker_id, resize.width, resize.height);
                   revert.detach();
                 } catch (const std::system_error &e) {
-                  BOOST_LOG(error) << "Live resize: couldn't start the display revert thread: "sv << e.what();
+                  BOOST_LOG(error) << "Live resize: could not start the display revert thread: "sv << e.what();
                   resize.worker_id.store(0, std::memory_order_release);
                 }
               }
