@@ -612,32 +612,71 @@ function Get-StreamActivity {
 # ---------------------------------------------------------------------------
 # Service control
 # ---------------------------------------------------------------------------
+# Stops the service without a blocking call. A service that stays in
+# StopPending must not block the run: request the stop, poll the status for
+# a maximum of 60 s, then stop sunshine.exe.
 function Stop-Apollo {
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if ($svc -and $svc.Status -ne 'Stopped') {
         Write-Log "Stop $ServiceName"
-        Stop-Service -Name $ServiceName -Force
-        $svc.WaitForStatus('Stopped', (New-TimeSpan -Seconds 60))
+        if ($svc.Status -ne 'StopPending') {
+            try { $svc.Stop() } catch { Write-Log ("Stop request for $ServiceName failed: " + $_.Exception.Message) 'WARN' }
+        }
+        $deadline = (Get-Date).AddSeconds(60)
+        while ($true) {
+            $svc.Refresh()
+            if ($svc.Status -eq 'Stopped') { break }
+            if ((Get-Date) -gt $deadline) {
+                Write-Log "$ServiceName did not stop in 60 s (status $($svc.Status)). Stop sunshine.exe." 'WARN'
+                break
+            }
+            Start-Sleep -Seconds 1
+        }
     }
     $deadline = (Get-Date).AddSeconds(20)
+    $taskkillDone = $false
     while ($true) {
         $procs = @(Get-Process -Name sunshine -ErrorAction SilentlyContinue)
         if ($procs.Count -eq 0) { break }
-        if ((Get-Date) -gt $deadline) { throw 'sunshine.exe does not stop.' }
+        if ((Get-Date) -gt $deadline) {
+            if ($taskkillDone) { throw 'sunshine.exe does not stop.' }
+            # Last try: one forced stop with taskkill, then 10 s more.
+            $taskkillDone = $true
+            try {
+                $out = & taskkill.exe /F /IM sunshine.exe 2>&1
+                Write-Log "taskkill /F /IM sunshine.exe exit code: $LASTEXITCODE $out" 'WARN'
+            } catch {
+                Write-Log ('taskkill /F /IM sunshine.exe failed: ' + $_.Exception.Message) 'ERROR'
+            }
+            $deadline = (Get-Date).AddSeconds(10)
+            continue
+        }
         foreach ($p in $procs) {
             Write-Log "Stop sunshine.exe process $($p.Id)"
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
         }
         Start-Sleep -Seconds 1
     }
+    if ($svc) {
+        $svc.Refresh()
+        if ($svc.Status -ne 'Stopped') { throw "$ServiceName does not stop (status $($svc.Status))." }
+    }
 }
 
+# Starts the service without a blocking call. Polls the status for a
+# maximum of 60 s.
 function Start-Apollo {
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if (-not $svc) { throw "Service $ServiceName does not exist." }
-    if ($svc.Status -ne 'Running') {
-        Write-Log "Start $ServiceName"
-        Start-Service -Name $ServiceName
+    if ($svc.Status -eq 'Running') { return }
+    Write-Log "Start $ServiceName"
+    if ($svc.Status -ne 'StartPending') { $svc.Start() }
+    $deadline = (Get-Date).AddSeconds(60)
+    while ($true) {
+        $svc.Refresh()
+        if ($svc.Status -eq 'Running') { return }
+        if ((Get-Date) -gt $deadline) { throw "$ServiceName did not start in 60 s (status $($svc.Status))." }
+        Start-Sleep -Seconds 1
     }
 }
 
@@ -742,14 +781,8 @@ function Restore-Backup {
         Stop-Apollo
     } catch {
         $failures++
+        # Stop-Apollo already tried taskkill. Continue to the start attempt.
         Write-Log ("Cannot stop ${ServiceName}: " + $_.Exception.Message) 'ERROR'
-        # Try one forced stop of sunshine.exe, then continue.
-        try {
-            $out = & taskkill.exe /F /IM sunshine.exe 2>&1
-            Write-Log "taskkill /F /IM sunshine.exe exit code: $LASTEXITCODE $out" 'WARN'
-        } catch {
-            Write-Log ('taskkill /F /IM sunshine.exe failed: ' + $_.Exception.Message) 'ERROR'
-        }
     }
     $root = $null
     $zip = $null
@@ -1031,7 +1064,12 @@ function Invoke-Update {
     }
 
     # 5. Roll back.
-    Set-Content -LiteralPath $failedMarker -Value ("Failed at {0}" -f (Get-Date -Format 's')) -Encoding ASCII
+    # An error here must not stop the restore (the service is stopped).
+    try {
+        Set-Content -LiteralPath $failedMarker -Value ("Failed at {0}" -f (Get-Date -Format 's')) -Encoding ASCII
+    } catch {
+        Write-Log ("Cannot write ${failedMarker}: " + $_.Exception.Message) 'ERROR'
+    }
     try {
         Restore-Backup -Backup $backup -Baseline $baseline
         Write-Log "Update to $($best.Tag) failed. The backup is restored. The download stays in $tagDir." 'ERROR'

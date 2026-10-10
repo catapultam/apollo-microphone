@@ -118,7 +118,13 @@ publish a fixed release, or (as administrator) disable the task.
 9. Records the health before the update: does `sunshine.exe` run, and does
    it listen on the base port (`port` in `sunshine.conf`, default 47989)
    and the web UI port (base + 1).
-10. Stops `ApolloService` and all `sunshine.exe` processes. Makes a backup:
+10. Stops `ApolloService` and all `sunshine.exe` processes. The stop does
+    not block: it requests the stop and polls the status for a maximum of
+    60 s. Then it stops `sunshine.exe` (maximum 20 s, then one
+    `taskkill /F /IM sunshine.exe` and 10 s more). If the service or
+    `sunshine.exe` does not stop, the updater starts the service again and
+    stops with exit 1. The service start also does not block (maximum
+    60 s). Makes a backup:
     `data\backups\auto-<ts>.zip` (all of `C:\Program Files\Apollo` without
     `*.log`), `auto-config-<ts>\` (copy of `config`, with `credentials`,
     without `*.log`) and `auto-config-<ts>.acl` (`icacls /save` of the ACLs
@@ -141,9 +147,11 @@ publish a fixed release, or (as administrator) disable the task.
     files. Then start the service and do the health check (without the
     version). Exit 2. If the restore fails, exit 3.
     An error does not stop the restore before the service start:
-    - If the old uninstaller check or the service stop fails, the updater
-      logs the error and continues. If the stop fails, it runs
-      `taskkill /F /IM sunshine.exe` one time first.
+    - If the failure marker cannot be written, the updater logs the error
+      and continues with the restore.
+    - If the old uninstaller check or the service stop (see step 10, with
+      the `taskkill` fallback) fails, the updater logs the error and
+      continues.
     - If the zip does not open, the updater logs the error and continues
       without extraction.
     - An error on one zip file: the updater writes the file and the error to
