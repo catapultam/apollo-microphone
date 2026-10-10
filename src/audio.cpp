@@ -344,17 +344,17 @@ namespace audio {
     ref = {};
   }
 
-  int write_mic_data(const char *data, std::size_t len, std::uint16_t sequence_number) {
+  int write_mic_data(const char *data, std::size_t len, std::uint16_t sequence_number, std::uint32_t timestamp) {
     auto &held_ref = mic_redirect_audio_ctx();
     auto ref = held_ref ? held_ref : get_audio_ctx_ref();
     if (!ref || !ref->control) {
       BOOST_LOG(warning) << "Client microphone packet rejected before decode because audio control is unavailable"
-                         << " [seq=" << sequence_number << ", len=" << len << ']';
+                         << " [seq=" << sequence_number << ", ts=" << timestamp << ", len=" << len << ']';
       mic_debug_on_packet_dropped(sequence_number, "Audio control is unavailable while writing microphone data");
       return -1;
     }
 
-    return ref->control->write_mic_data(data, len, sequence_number);
+    return ref->control->write_mic_data(data, len, sequence_number, timestamp);
   }
 
   mic_debug_snapshot_t get_mic_debug_snapshot() {
@@ -422,6 +422,46 @@ namespace audio {
     state.snapshot.target_device_name = target_device_name;
     state.snapshot.state = "Rendering client microphone into " + target_device_name;
     append_mic_event(state, "Using host render target [" + target_device_name + "] at " + std::to_string(channels) + "ch/" + std::to_string(sample_rate) + "Hz");
+  }
+
+  void mic_debug_on_backend_format(const std::string &endpoint_mix_format,
+                                   const std::string &render_format,
+                                   bool resampling_active,
+                                   const std::string &channel_mapping) {
+    auto &state = mic_debug_state();
+    std::lock_guard lock(state.mutex);
+    state.snapshot.endpoint_mix_format = endpoint_mix_format;
+    state.snapshot.render_format = render_format;
+    state.snapshot.resampling_active = resampling_active;
+    state.snapshot.channel_mapping = channel_mapping;
+    append_mic_event(
+      state,
+      "Endpoint mix format [" + endpoint_mix_format + "], render format [" + render_format +
+      "], resampling " + (resampling_active ? "enabled" : "disabled")
+    );
+  }
+
+  void mic_debug_on_backend_endpoint_formats(const std::string &render_device_format,
+                                             const std::string &capture_device_name,
+                                             const std::string &capture_endpoint_mix_format,
+                                             const std::string &capture_device_format,
+                                             bool recommended_format_enforced,
+                                             bool recommended_format_active) {
+    auto &state = mic_debug_state();
+    std::lock_guard lock(state.mutex);
+    state.snapshot.render_device_format = render_device_format;
+    state.snapshot.capture_device_name = capture_device_name;
+    state.snapshot.capture_endpoint_mix_format = capture_endpoint_mix_format;
+    state.snapshot.capture_device_format = capture_device_format;
+    state.snapshot.recommended_format_enforced = recommended_format_enforced;
+    state.snapshot.recommended_format_active = recommended_format_active;
+    append_mic_event(
+      state,
+      "Render device format [" + render_device_format + "], capture device [" + capture_device_name +
+      "], capture mix [" + capture_endpoint_mix_format + "], recommended format " +
+      (recommended_format_active ? "active" : "inactive") +
+      (recommended_format_enforced ? " (enforced)" : "")
+    );
   }
 
   void mic_debug_on_backend_error(const std::string &message) {
@@ -496,7 +536,7 @@ namespace audio {
     state.last_render_time = std::chrono::steady_clock::now();
     state.has_last_render_time = true;
     if (state.snapshot.packets_rendered == 1) {
-      set_mic_state_locked(state, "Apollo is rendering microphone audio into VB-Cable");
+      set_mic_state_locked(state, "Apollo is rendering microphone audio into Steam Streaming Microphone");
     }
   }
 

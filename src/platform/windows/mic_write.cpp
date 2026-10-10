@@ -5,16 +5,20 @@
 #include "mic_write.h"
 
 #include <algorithm>
-#include <array>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <cwctype>
 #include <string_view>
 #include <vector>
 
 #include <Audioclient.h>
+#include <ksmedia.h>
 #include <mmdeviceapi.h>
 #include <opus/opus.h>
+#include <synchapi.h>
 
+#include "PolicyConfig.h"
 #include "misc.h"
 #include "src/audio.h"
 #include "src/config.h"
@@ -35,6 +39,15 @@ namespace platf::audio {
       2
     };
 
+    constexpr std::uint32_t decoded_sample_rate = 48000;
+    constexpr REFERENCE_TIME buffer_duration_100ns = 1000000;
+    constexpr std::uint32_t default_packet_duration_samples = 960;
+    constexpr std::uint32_t max_packet_duration_samples = 5760;
+    constexpr std::size_t max_queued_frames = decoded_sample_rate;
+    constexpr std::size_t max_queued_packets = 64;
+    constexpr std::size_t target_prebuffer_packets = 4;
+    constexpr std::size_t target_prebuffer_frames = default_packet_duration_samples * target_prebuffer_packets;
+
     template<typename T>
     void co_task_free(T *ptr) {
       if (ptr) {
@@ -45,7 +58,9 @@ namespace platf::audio {
     using device_t = util::safe_ptr<IMMDevice, release_com<IMMDevice>>;
     using collection_t = util::safe_ptr<IMMDeviceCollection, release_com<IMMDeviceCollection>>;
     using prop_t = util::safe_ptr<IPropertyStore, release_com<IPropertyStore>>;
+    using policy_t = util::safe_ptr<IPolicyConfig, release_com<IPolicyConfig>>;
     using wstring_t = util::safe_ptr<WCHAR, co_task_free<WCHAR>>;
+    using waveformat_t = util::safe_ptr<WAVEFORMATEX, co_task_free<WAVEFORMATEX>>;
 
     class prop_var_t {
     public:
@@ -58,6 +73,22 @@ namespace platf::audio {
       }
 
       PROPVARIANT value;
+    };
+
+    struct parsed_waveformat_t {
+      WORD channels {};
+      DWORD sample_rate {};
+      WORD bits_per_sample {};
+      WORD valid_bits_per_sample {};
+      WORD block_align {};
+      DWORD channel_mask {};
+      bool is_float {};
+    };
+
+    struct endpoint_format_info_t {
+      std::string mix_format {"unavailable"};
+      std::string device_format {"unavailable"};
+      bool recommended_active {};
     };
 
     std::wstring get_prop_string(IPropertyStore *prop, REFPROPERTYKEY key) {
@@ -75,10 +106,72 @@ namespace platf::audio {
       return haystack.find(needle) != std::wstring::npos;
     }
 
+    std::wstring endpoint_label(EDataFlow flow) {
+      return flow == eCapture ? L"capture" : L"render";
+    }
+
+    parsed_waveformat_t parse_waveformat(const WAVEFORMATEX *format) {
+      parsed_waveformat_t parsed {};
+      if (format == nullptr) {
+        return parsed;
+      }
+
+      parsed.channels = format->nChannels;
+      parsed.sample_rate = format->nSamplesPerSec;
+      parsed.bits_per_sample = format->wBitsPerSample;
+      parsed.valid_bits_per_sample = format->wBitsPerSample;
+      parsed.block_align = format->nBlockAlign;
+
+      if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE && format->cbSize >= 22) {
+        const auto *extensible = reinterpret_cast<const WAVEFORMATEXTENSIBLE *>(format);
+        parsed.valid_bits_per_sample = extensible->Samples.wValidBitsPerSample ? extensible->Samples.wValidBitsPerSample : format->wBitsPerSample;
+        parsed.channel_mask = extensible->dwChannelMask;
+
+        parsed.is_float = extensible->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT &&
+                          format->wBitsPerSample == 32 &&
+                          parsed.valid_bits_per_sample == 32;
+      } else if (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT &&
+                 format->wBitsPerSample == 32) {
+        parsed.is_float = true;
+      }
+
+      return parsed;
+    }
+
+    std::string waveformat_to_pretty_string(const WAVEFORMATEX *format) {
+      const auto parsed = parse_waveformat(format);
+      if (format == nullptr) {
+        return "unavailable";
+      }
+
+      std::string result = parsed.is_float ? "float32" : "pcm";
+      result += ", ";
+      result += std::to_string(parsed.valid_bits_per_sample ? parsed.valid_bits_per_sample : parsed.bits_per_sample);
+      result += "-bit";
+      result += ", ";
+      result += std::to_string(parsed.sample_rate);
+      result += " Hz, ";
+      result += std::to_string(parsed.channels);
+      result += "ch";
+      if (parsed.channel_mask != 0) {
+        result += ", mask=0x";
+        result += util::hex(parsed.channel_mask).to_string();
+      }
+      return result;
+    }
+
     bool is_recoverable_device_error(HRESULT status) {
       return status == AUDCLNT_E_DEVICE_INVALIDATED ||
              status == AUDCLNT_E_RESOURCES_INVALIDATED ||
              status == AUDCLNT_E_SERVICE_NOT_RUNNING;
+    }
+
+    std::uint16_t sequence_distance(std::uint16_t newer, std::uint16_t older) {
+      return static_cast<std::uint16_t>(newer - older);
+    }
+
+    std::uint32_t timestamp_distance(std::uint32_t newer, std::uint32_t older) {
+      return static_cast<std::uint32_t>(newer - older);
     }
 
     bool recover_device(mic_write_wasapi_t &writer, HRESULT status, const char *operation) {
@@ -92,6 +185,147 @@ namespace platf::audio {
       writer.cleanup();
       return writer.init() == 0;
     }
+
+    std::vector<BYTE> make_recommended_steam_mic_device_waveformat() {
+      WAVEFORMATEXTENSIBLE pcm_format {};
+      pcm_format.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+      pcm_format.Format.nChannels = 2;
+      pcm_format.Format.nSamplesPerSec = decoded_sample_rate;
+      pcm_format.Format.wBitsPerSample = 32;
+      pcm_format.Samples.wValidBitsPerSample = 32;
+      pcm_format.Format.nBlockAlign = static_cast<WORD>(pcm_format.Format.nChannels * (pcm_format.Format.wBitsPerSample / 8));
+      pcm_format.Format.nAvgBytesPerSec = pcm_format.Format.nSamplesPerSec * pcm_format.Format.nBlockAlign;
+      pcm_format.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+      pcm_format.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+      pcm_format.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+
+      std::vector<BYTE> storage(sizeof(pcm_format));
+      std::memcpy(storage.data(), &pcm_format, sizeof(pcm_format));
+      return storage;
+    }
+
+    std::vector<BYTE> make_required_steam_mic_render_waveformat() {
+      WAVEFORMATEXTENSIBLE float_format {};
+      float_format.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+      float_format.Format.nChannels = 2;
+      float_format.Format.nSamplesPerSec = decoded_sample_rate;
+      float_format.Format.wBitsPerSample = 32;
+      float_format.Samples.wValidBitsPerSample = 32;
+      float_format.Format.nBlockAlign = static_cast<WORD>(float_format.Format.nChannels * sizeof(float));
+      float_format.Format.nAvgBytesPerSec = float_format.Format.nSamplesPerSec * float_format.Format.nBlockAlign;
+      float_format.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+      float_format.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+      float_format.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+
+      std::vector<BYTE> storage(sizeof(float_format));
+      std::memcpy(storage.data(), &float_format, sizeof(float_format));
+      return storage;
+    }
+
+    bool is_recommended_steam_mic_device_format(const WAVEFORMATEX *format) {
+      const auto parsed = parse_waveformat(format);
+      return parsed.channels == 2 &&
+             parsed.sample_rate == decoded_sample_rate &&
+             parsed.valid_bits_per_sample == 32;
+    }
+
+    endpoint_format_info_t query_endpoint_format_info(IMMDeviceEnumerator *device_enum, const std::wstring &device_id) {
+      endpoint_format_info_t info;
+
+      policy_t policy;
+      auto status = CoCreateInstance(
+        CLSID_CPolicyConfigClient,
+        nullptr,
+        CLSCTX_ALL,
+        IID_IPolicyConfig,
+        reinterpret_cast<void **>(&policy)
+      );
+      if (FAILED(status) || !policy) {
+        return info;
+      }
+
+      waveformat_t current_format;
+      status = policy->GetDeviceFormat(device_id.c_str(), false, &current_format);
+      if (SUCCEEDED(status) && current_format) {
+        info.device_format = waveformat_to_pretty_string(current_format.get());
+        info.recommended_active = is_recommended_steam_mic_device_format(current_format.get());
+      }
+
+      device_t device;
+      status = device_enum ? device_enum->GetDevice(device_id.c_str(), &device) : E_FAIL;
+      if (FAILED(status) || !device) {
+        return info;
+      }
+
+      util::safe_ptr<IAudioClient, release_com<IAudioClient>> local_audio_client;
+      status = device->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, reinterpret_cast<void **>(&local_audio_client));
+      if (FAILED(status) || !local_audio_client) {
+        return info;
+      }
+
+      waveformat_t mix_format;
+      status = local_audio_client->GetMixFormat(&mix_format);
+      if (SUCCEEDED(status) && mix_format) {
+        info.mix_format = waveformat_to_pretty_string(mix_format.get());
+      }
+
+      return info;
+    }
+
+    bool ensure_recommended_steam_mic_format(const std::wstring &device_id, const std::string &target_device_name, EDataFlow flow) {
+      policy_t policy;
+      auto status = CoCreateInstance(
+        CLSID_CPolicyConfigClient,
+        nullptr,
+        CLSCTX_ALL,
+        IID_IPolicyConfig,
+        reinterpret_cast<void **>(&policy)
+      );
+      if (FAILED(status) || !policy) {
+        BOOST_LOG(warning) << "Couldn't create audio policy config for Steam microphone format setup: 0x"
+                           << util::hex(status).to_string_view();
+        return false;
+      }
+
+      waveformat_t current_format;
+      status = policy->GetDeviceFormat(device_id.c_str(), false, &current_format);
+      if (FAILED(status) || !current_format) {
+        BOOST_LOG(warning) << "Couldn't query Steam microphone " << to_utf8(endpoint_label(flow)) << " device format for [" << target_device_name << "]: 0x"
+                           << util::hex(status).to_string_view();
+        return false;
+      }
+
+      if (is_recommended_steam_mic_device_format(current_format.get())) {
+        return true;
+      }
+
+      auto recommended_format_storage = make_recommended_steam_mic_device_waveformat();
+      auto *recommended_format = reinterpret_cast<WAVEFORMATEX *>(recommended_format_storage.data());
+      WAVEFORMATEXTENSIBLE previous_format {};
+      status = policy->SetDeviceFormat(device_id.c_str(), recommended_format, reinterpret_cast<WAVEFORMATEX *>(&previous_format));
+      if (FAILED(status)) {
+        BOOST_LOG(warning) << "Couldn't set Steam microphone " << to_utf8(endpoint_label(flow))
+                           << " device format to stereo 32-bit 48k for [" << target_device_name << "]: 0x"
+                           << util::hex(status).to_string_view();
+        return false;
+      }
+
+      BOOST_LOG(info) << "Changed Steam microphone " << to_utf8(endpoint_label(flow)) << " device format for [" << target_device_name
+                      << "] to [pcm, 32-bit, 48000 Hz, 2ch]";
+      return true;
+    }
+
+    HRESULT initialize_shared_audio_client(IAudioClient *audio_client, const WAVEFORMATEX *format, DWORD stream_flags) {
+      return audio_client->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        stream_flags,
+        buffer_duration_100ns,
+        0,
+        format,
+        nullptr
+      );
+    }
+
   }  // namespace
 
   mic_write_wasapi_t::mic_write_wasapi_t(std::string backend_name,
@@ -110,21 +344,21 @@ namespace platf::audio {
     return backend_name;
   }
 
-  bool mic_write_wasapi_t::find_target_device(std::wstring &device_id, std::string &device_name) {
+  bool mic_write_wasapi_t::find_target_device(EDataFlow flow, std::wstring &device_id, std::string &device_name) {
     collection_t collection;
-    HRESULT status = device_enum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection);
+    HRESULT status = device_enum->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &collection);
     if (FAILED(status) || !collection) {
-      BOOST_LOG(error) << "Couldn't enumerate render devices for microphone redirection: 0x" << util::hex(status).to_string_view();
+      BOOST_LOG(error) << "Couldn't enumerate " << to_utf8(endpoint_label(flow))
+                       << " devices for microphone redirection: 0x" << util::hex(status).to_string_view();
       return false;
     }
 
     std::wstring requested_name = requested_device_name.empty() ? std::wstring {} : from_utf8(requested_device_name);
     auto patterns = autodetect_patterns;
     if (patterns.empty()) {
-      patterns = {
-        L"CABLE Input",
-        L"VB-Audio Virtual Cable",
-      };
+      patterns = flow == eCapture ?
+        std::vector<std::wstring> {L"Microphone (Steam Streaming Microphone)", L"Steam Streaming Microphone"} :
+        std::vector<std::wstring> {L"Steam Streaming Microphone", L"Speakers (Steam Streaming Microphone)"};
     }
 
     UINT count = 0;
@@ -183,11 +417,12 @@ namespace platf::audio {
   }
 
   bool mic_write_wasapi_t::initialize_device() {
-    std::wstring device_id;
-    if (!find_target_device(device_id, target_device_name)) {
+    std::wstring render_device_id;
+    if (!find_target_device(eRender, render_device_id, target_device_name)) {
       if (requested_device_name.empty()) {
-        BOOST_LOG(warning) << "No supported VB-CABLE playback device found. Install VB-CABLE and ensure \"CABLE Input\" is available.";
-        ::audio::mic_debug_on_backend_error("VB-CABLE was not found on the host. Install VB-CABLE and ensure CABLE Input is available.");
+        BOOST_LOG(warning) << "No supported Steam Streaming Microphone playback device found. Install the Steam audio drivers and ensure "
+                           << "\"Speakers (Steam Streaming Microphone)\" is available.";
+        ::audio::mic_debug_on_backend_error("Steam Streaming Microphone was not found on the host. Install the local Steam audio drivers and ensure Speakers (Steam Streaming Microphone) is available.");
       } else {
         BOOST_LOG(warning) << "Requested microphone device not found: " << requested_device_name;
         ::audio::mic_debug_on_backend_error("Requested microphone render device was not found: " + requested_device_name);
@@ -195,8 +430,23 @@ namespace platf::audio {
       return false;
     }
 
+    std::wstring capture_device_id;
+    std::string capture_device_name;
+    if (!find_target_device(eCapture, capture_device_id, capture_device_name)) {
+      BOOST_LOG(warning) << "Couldn't find the paired Steam microphone capture endpoint. Host applications may read from a stale or mismatched format.";
+      ::audio::mic_debug_on_backend_error("Could not find the paired Microphone (Steam Streaming Microphone) capture endpoint");
+      return false;
+    }
+
+    const bool render_format_enforced = ensure_recommended_steam_mic_format(render_device_id, target_device_name, eRender);
+    const bool capture_format_enforced = ensure_recommended_steam_mic_format(capture_device_id, capture_device_name, eCapture);
+    const auto render_endpoint_info = query_endpoint_format_info(device_enum.get(), render_device_id);
+    const auto capture_endpoint_info = query_endpoint_format_info(device_enum.get(), capture_device_id);
+    const bool recommended_format_active = render_endpoint_info.recommended_active && capture_endpoint_info.recommended_active;
+    const bool recommended_format_enforced = render_format_enforced || capture_format_enforced;
+
     device_t device;
-    HRESULT status = device_enum->GetDevice(device_id.c_str(), &device);
+    HRESULT status = device_enum->GetDevice(render_device_id.c_str(), &device);
     if (FAILED(status) || !device) {
       BOOST_LOG(error) << "Couldn't open microphone playback device [" << target_device_name << "]: 0x" << util::hex(status).to_string_view();
       ::audio::mic_debug_on_backend_error("Could not open host microphone render device [" + target_device_name + "]");
@@ -210,35 +460,29 @@ namespace platf::audio {
       return false;
     }
 
-    std::array<WAVEFORMATEX, 4> formats {{
-      {WAVE_FORMAT_PCM, 1, 48000, 96000, 2, 16, 0},
-      {WAVE_FORMAT_PCM, 2, 48000, 192000, 4, 16, 0},
-      {WAVE_FORMAT_PCM, 1, 44100, 88200, 2, 16, 0},
-      {WAVE_FORMAT_PCM, 2, 44100, 176400, 4, 16, 0},
-    }};
-
-    HRESULT init_status = E_FAIL;
-    constexpr REFERENCE_TIME buffer_duration_100ns = 1000000;
-    for (const auto &format : formats) {
-      init_status = audio_client->Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-        buffer_duration_100ns,
-        0,
-        &format,
-        nullptr
-      );
-      if (SUCCEEDED(init_status)) {
-        active_format = format;
-        break;
-      }
-    }
-
-    if (FAILED(init_status)) {
-      BOOST_LOG(error) << "Couldn't initialize microphone playback client [" << target_device_name << "]: 0x" << util::hex(init_status).to_string_view();
-      ::audio::mic_debug_on_backend_error("Could not initialize the host microphone playback client for [" + target_device_name + "]");
+    waveformat_t mix_format;
+    status = audio_client->GetMixFormat(&mix_format);
+    if (FAILED(status) || !mix_format) {
+      BOOST_LOG(error) << "Couldn't get microphone playback mix format for [" << target_device_name << "]: 0x" << util::hex(status).to_string_view();
+      ::audio::mic_debug_on_backend_error("Could not query the Steam Streaming Microphone endpoint mix format");
       return false;
     }
+
+    const auto endpoint_mix_string = waveformat_to_pretty_string(mix_format.get());
+    active_format_storage = make_required_steam_mic_render_waveformat();
+    auto *required_render_format = reinterpret_cast<WAVEFORMATEX *>(active_format_storage.data());
+
+    const auto init_status = initialize_shared_audio_client(audio_client.get(), required_render_format, AUDCLNT_STREAMFLAGS_EVENTCALLBACK);
+    if (FAILED(init_status)) {
+      BOOST_LOG(error) << "Couldn't initialize microphone playback client [" << target_device_name
+                       << "] with required format [float32, 32-bit, 48000 Hz, 2ch]: 0x"
+                       << util::hex(init_status).to_string_view();
+      ::audio::mic_debug_on_backend_error("Steam Streaming Microphone must support 2ch, 32-bit float, 48000 Hz");
+      return false;
+    }
+
+    std::memset(&active_format, 0, sizeof(active_format));
+    std::memcpy(&active_format, active_format_storage.data(), std::min(active_format_storage.size(), sizeof(active_format)));
 
     status = audio_client->GetBufferSize(&buffer_frame_count);
     if (FAILED(status)) {
@@ -254,9 +498,49 @@ namespace platf::audio {
       return false;
     }
 
+    render_event.reset(CreateEvent(nullptr, FALSE, FALSE, nullptr));
+    if (!render_event) {
+      BOOST_LOG(error) << "Couldn't create microphone playback event handle: 0x" << util::hex(GetLastError()).to_string_view();
+      ::audio::mic_debug_on_backend_error("Could not create the microphone playback event handle");
+      return false;
+    }
+
+    status = audio_client->SetEventHandle(render_event.get());
+    if (FAILED(status)) {
+      BOOST_LOG(error) << "Couldn't set microphone playback event handle: 0x" << util::hex(status).to_string_view();
+      ::audio::mic_debug_on_backend_error("Could not set the microphone playback event handle");
+      return false;
+    }
+
+    const auto render_format_string = waveformat_to_pretty_string(required_render_format);
+    const std::string channel_mapping = "Duplicate mono microphone input to stereo render channels";
+
     BOOST_LOG(info) << "Client microphone redirection target: " << target_device_name
-                    << " (" << active_format.nChannels << "ch @" << active_format.nSamplesPerSec << "Hz)";
+                    << " [mix=" << endpoint_mix_string
+                    << ", render-device=" << render_endpoint_info.device_format
+                    << ", capture-device=" << capture_endpoint_info.device_format
+                    << ", render=" << render_format_string
+                    << ", init=required float32 shared-mode render format"
+                    << ", resampling=off"
+                    << ']';
+
+    BOOST_LOG(info) << "Paired Steam microphone capture endpoint: " << capture_device_name
+                    << " [mix=" << capture_endpoint_info.mix_format
+                    << ", device=" << capture_endpoint_info.device_format
+                    << ", recommended=" << (recommended_format_active ? "active" : "inactive")
+                    << ", enforced=" << (recommended_format_enforced ? "yes" : "no")
+                    << ']';
+
     ::audio::mic_debug_on_backend_target(target_device_name, active_format.nChannels, active_format.nSamplesPerSec);
+    ::audio::mic_debug_on_backend_format(endpoint_mix_string, render_format_string, false, channel_mapping);
+    ::audio::mic_debug_on_backend_endpoint_formats(
+      render_endpoint_info.device_format,
+      capture_device_name,
+      capture_endpoint_info.mix_format,
+      capture_endpoint_info.device_format,
+      recommended_format_enforced,
+      recommended_format_active
+    );
 
     status = audio_client->Start();
     if (FAILED(status)) {
@@ -265,12 +549,15 @@ namespace platf::audio {
       return false;
     }
 
+    stop_render_thread = false;
+    render_thread = std::thread {[this]() { render_loop(); }};
+
     return true;
   }
 
   int mic_write_wasapi_t::init() {
     int opus_error = OPUS_OK;
-    opus_decoder = opus_decoder_create(48000, 1, &opus_error);
+    opus_decoder = opus_decoder_create(decoded_sample_rate, 1, &opus_error);
     if (opus_error != OPUS_OK || opus_decoder == nullptr) {
       BOOST_LOG(error) << "Couldn't create Opus decoder for microphone redirection: " << opus_strerror(opus_error);
       ::audio::mic_debug_on_backend_error("Could not create the Opus decoder for microphone redirection");
@@ -293,127 +580,356 @@ namespace platf::audio {
     return 0;
   }
 
-  int mic_write_wasapi_t::write_data(const char *data, std::size_t len, std::uint16_t sequence_number) {
-    if (!audio_client || audio_render == nullptr || opus_decoder == nullptr || data == nullptr || len == 0) {
+  int mic_write_wasapi_t::write_data(const char *data, std::size_t len, std::uint16_t sequence_number, std::uint32_t timestamp) {
+    if (!audio_client || audio_render == nullptr || opus_decoder == nullptr || data == nullptr || len == 0 || !render_event) {
       BOOST_LOG(warning) << "Client microphone packet rejected before decode because the WASAPI write path is not ready"
                          << " [seq=" << sequence_number
+                         << ", ts=" << timestamp
                          << ", len=" << len
                          << ", audio_client=" << static_cast<bool>(audio_client)
                          << ", audio_render=" << static_cast<bool>(audio_render != nullptr)
                          << ", opus_decoder=" << static_cast<bool>(opus_decoder != nullptr)
+                         << ", render_event=" << static_cast<bool>(render_event)
                          << ", data=" << static_cast<bool>(data != nullptr) << ']';
       return -1;
     }
 
-    std::array<opus_int16, 960> mono_pcm {};
-    const auto decoded_frames = opus_decode(opus_decoder, reinterpret_cast<const unsigned char *>(data), static_cast<opus_int32>(len), mono_pcm.data(), static_cast<int>(mono_pcm.size()), 0);
-    if (decoded_frames <= 0) {
-      BOOST_LOG(debug) << "Couldn't decode microphone Opus frame";
-      ::audio::mic_debug_on_decode_error(sequence_number, "The host could not decode the incoming Opus microphone frame");
+    if (active_format.nChannels != 2 || active_format.nSamplesPerSec != decoded_sample_rate || active_format.wBitsPerSample != 32) {
+      ::audio::mic_debug_on_render_error(sequence_number, "Steam Streaming Microphone is not running at the required 2ch, 32-bit float, 48000 Hz format");
       return -1;
     }
 
-    int peak = 0;
-    for (int i = 0; i < decoded_frames; ++i) {
-      const int sample = mono_pcm[i] < 0 ? -mono_pcm[i] : mono_pcm[i];
-      peak = std::max(peak, sample);
-    }
-    const double normalized_level = static_cast<double>(peak) / 32767.0;
-    const bool silent = peak < 512;
-    ::audio::mic_debug_on_packet_decoded(sequence_number, normalized_level, silent);
+    bool stale_packet = false;
+    bool duplicate_packet = false;
+    bool trimmed_packet_queue = false;
+    {
+      std::lock_guard lock(queue_mutex);
 
-    std::vector<opus_int16> output_pcm;
-    output_pcm.reserve(decoded_frames * active_format.nChannels);
-    if (active_format.nChannels == 1) {
-      output_pcm.insert(output_pcm.end(), mono_pcm.begin(), mono_pcm.begin() + decoded_frames);
-    } else {
-      for (int i = 0; i < decoded_frames; ++i) {
-        output_pcm.push_back(mono_pcm[i]);
-        output_pcm.push_back(mono_pcm[i]);
+      if (has_playout_cursor) {
+        const auto behind = sequence_distance(expected_sequence_number, sequence_number);
+        if (behind != 0 && behind < 0x8000) {
+          stale_packet = true;
+        }
+      }
+
+      if (!stale_packet) {
+        auto [_, inserted] = pending_packets.emplace(sequence_number, queued_mic_packet_t {
+          std::vector<std::uint8_t> {reinterpret_cast<const std::uint8_t *>(data), reinterpret_cast<const std::uint8_t *>(data) + len},
+          sequence_number,
+          timestamp,
+          std::chrono::steady_clock::now()
+        });
+
+        duplicate_packet = !inserted;
+        if (inserted && pending_packets.size() > max_queued_packets) {
+          pending_packets.erase(pending_packets.begin());
+          trimmed_packet_queue = true;
+        }
       }
     }
 
-    const auto bytes_per_frame = static_cast<std::size_t>(active_format.nBlockAlign);
-    UINT32 frames_written = 0;
-    int empty_buffer_waits = 0;
-    while (frames_written < static_cast<UINT32>(decoded_frames)) {
+    if (stale_packet) {
+      ::audio::mic_debug_on_packet_dropped(sequence_number, "Dropped a stale microphone packet that arrived after its playout deadline");
+      return 0;
+    }
+
+    if (duplicate_packet) {
+      ::audio::mic_debug_on_packet_dropped(sequence_number, "Dropped a duplicate microphone packet");
+      return 0;
+    }
+
+    if (trimmed_packet_queue) {
+      BOOST_LOG(debug) << "Trimmed queued microphone packets for [" << target_device_name << "] to keep jitter-buffer latency bounded";
+      ::audio::mic_debug_on_render_error(sequence_number, "Queued microphone packets grew too large, so older packets were dropped to keep latency bounded");
+    }
+
+    SetEvent(render_event.get());
+    return static_cast<int>(len);
+  }
+
+  std::uint32_t mic_write_wasapi_t::infer_packet_duration_samples(std::uint32_t current_timestamp, std::uint32_t next_timestamp) const {
+    const auto delta = timestamp_distance(next_timestamp, current_timestamp);
+    if (delta >= 120 && delta <= max_packet_duration_samples) {
+      return delta;
+    }
+    return default_packet_duration_samples;
+  }
+
+  bool mic_write_wasapi_t::should_conceal_missing_packet_locked() const {
+    if (pending_packets.empty()) {
+      return false;
+    }
+
+    if (pending_packets.find(static_cast<std::uint16_t>(expected_sequence_number + 1)) != pending_packets.end()) {
+      return true;
+    }
+
+    const auto delta = sequence_distance(pending_packets.begin()->first, expected_sequence_number);
+    return delta != 0 && delta < 0x8000;
+  }
+
+  void mic_write_wasapi_t::append_decoded_frames(const float *samples, int decoded_frames, std::uint16_t sequence_number) {
+    if (samples == nullptr || decoded_frames <= 0) {
+      return;
+    }
+
+    float peak = 0.0f;
+    {
+      std::lock_guard lock(queue_mutex);
+      for (int frame = 0; frame < decoded_frames; ++frame) {
+        const float sample = std::clamp(samples[frame], -1.0f, 1.0f);
+        peak = std::max(peak, std::fabs(sample));
+        pending_frames.push_back(sample);
+      }
+
+      if (pending_frames.size() > max_queued_frames) {
+        const auto frames_to_trim = pending_frames.size() - max_queued_frames;
+        pending_frames.erase(pending_frames.begin(), pending_frames.begin() + static_cast<std::ptrdiff_t>(frames_to_trim));
+      }
+    }
+
+    const double normalized_level = std::clamp(static_cast<double>(peak), 0.0, 1.0);
+    const bool silent = peak < 0.015625f;
+    ::audio::mic_debug_on_packet_decoded(sequence_number, normalized_level, silent);
+    ::audio::mic_debug_on_packet_rendered(sequence_number, normalized_level, silent);
+  }
+
+  bool mic_write_wasapi_t::decode_next_packet() {
+    queued_mic_packet_t packet;
+    std::uint16_t packet_sequence = 0;
+    std::uint32_t frame_duration_samples = default_packet_duration_samples;
+    bool decode_fec = false;
+    bool decode_plc = false;
+
+    {
+      std::lock_guard lock(queue_mutex);
+
+      if (!has_playout_cursor) {
+        if (pending_packets.size() < target_prebuffer_packets) {
+          return false;
+        }
+
+        expected_sequence_number = pending_packets.begin()->first;
+        expected_timestamp = pending_packets.begin()->second.timestamp;
+        has_playout_cursor = true;
+      }
+
+      packet_sequence = expected_sequence_number;
+
+      if (auto current = pending_packets.find(expected_sequence_number); current != pending_packets.end()) {
+        if (auto next = std::next(current); next != pending_packets.end()) {
+          frame_duration_samples = infer_packet_duration_samples(current->second.timestamp, next->second.timestamp);
+        }
+
+        packet = std::move(current->second);
+        pending_packets.erase(current);
+      } else if (auto next = pending_packets.find(static_cast<std::uint16_t>(expected_sequence_number + 1)); next != pending_packets.end()) {
+        frame_duration_samples = infer_packet_duration_samples(expected_timestamp, next->second.timestamp);
+        packet = next->second;
+        decode_fec = true;
+      } else if (should_conceal_missing_packet_locked()) {
+        decode_plc = true;
+      } else {
+        return false;
+      }
+    }
+
+    std::vector<float> decoded_pcm(max_packet_duration_samples);
+    int decoded_frames = 0;
+    if (decode_plc) {
+      decoded_frames = opus_decode_float(opus_decoder, nullptr, 0, decoded_pcm.data(), static_cast<int>(frame_duration_samples), 0);
+      BOOST_LOG(debug) << "Applying Opus PLC for missing microphone packet on [" << target_device_name << "] sequence " << packet_sequence;
+    } else if (decode_fec) {
+      decoded_frames = opus_decode_float(
+        opus_decoder,
+        packet.payload.data(),
+        static_cast<opus_int32>(packet.payload.size()),
+        decoded_pcm.data(),
+        static_cast<int>(frame_duration_samples),
+        1
+      );
+      BOOST_LOG(debug) << "Applying Opus FEC for missing microphone packet on [" << target_device_name << "] sequence " << packet_sequence;
+    } else {
+      decoded_frames = opus_decode_float(
+        opus_decoder,
+        packet.payload.data(),
+        static_cast<opus_int32>(packet.payload.size()),
+        decoded_pcm.data(),
+        static_cast<int>(decoded_pcm.size()),
+        0
+      );
+    }
+
+    if (decoded_frames <= 0) {
+      ::audio::mic_debug_on_decode_error(packet_sequence, "The host could not decode a microphone frame from the jitter buffer");
+      std::vector<float> silent_pcm(frame_duration_samples, 0.0f);
+      append_decoded_frames(silent_pcm.data(), static_cast<int>(silent_pcm.size()), packet_sequence);
+      decoded_frames = static_cast<int>(silent_pcm.size());
+    } else {
+      append_decoded_frames(decoded_pcm.data(), decoded_frames, packet_sequence);
+
+      if (!first_packet_written_logged) {
+        first_packet_written_logged = true;
+        BOOST_LOG(info) << "Client microphone audio is being rendered into [" << target_device_name << ']';
+      }
+    }
+
+    {
+      std::lock_guard lock(queue_mutex);
+      expected_sequence_number = static_cast<std::uint16_t>(expected_sequence_number + 1);
+      expected_timestamp += static_cast<std::uint32_t>(decoded_frames);
+    }
+
+    return decoded_frames > 0;
+  }
+
+  void mic_write_wasapi_t::render_loop() {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED | COINIT_SPEED_OVER_MEMORY);
+    platf::adjust_thread_priority(platf::thread_priority_e::high);
+
+    while (!stop_render_thread) {
+      if (!audio_client || audio_render == nullptr || !render_event) {
+        break;
+      }
+
+      const auto wait_result = WaitForSingleObject(render_event.get(), 20);
+      if (stop_render_thread) {
+        break;
+      }
+      if (wait_result != WAIT_OBJECT_0 && wait_result != WAIT_TIMEOUT) {
+        BOOST_LOG(debug) << "Microphone render wait failed for [" << target_device_name << "]: 0x"
+                         << util::hex(GetLastError()).to_string_view();
+        continue;
+      }
+
       UINT32 padding = 0;
       auto status = audio_client->GetCurrentPadding(&padding);
       if (FAILED(status)) {
-        if (recover_device(*this, status, "querying microphone playback padding")) {
-          return 0;
+        BOOST_LOG(debug) << "Couldn't query microphone playback padding for [" << target_device_name << "]: 0x"
+                         << util::hex(status).to_string_view();
+        if (is_recoverable_device_error(status)) {
+          ::audio::mic_debug_on_backend_error("Steam microphone playback device was invalidated during rendering. Restart the stream.");
+          break;
         }
-        ::audio::mic_debug_on_render_error(sequence_number, "Could not query microphone playback padding");
-        return -1;
+        continue;
       }
 
       if (padding > buffer_frame_count) {
         padding = 0;
       }
 
-      auto frames_available = buffer_frame_count - padding;
+      const auto frames_available = buffer_frame_count - padding;
       if (frames_available == 0) {
-        if (++empty_buffer_waits > 8) {
-          break;
-        }
-        Sleep(5);
         continue;
       }
 
-      const auto frames_to_write = std::min<UINT32>(frames_available, static_cast<UINT32>(decoded_frames) - frames_written);
-      if (frames_to_write == 0) {
-        break;
+      while (true) {
+        std::size_t queued_frames = 0;
+        std::size_t queued_packets = 0;
+        {
+          std::lock_guard lock(queue_mutex);
+          queued_frames = pending_frames.size();
+          queued_packets = pending_packets.size();
+        }
+
+        if (queued_frames >= target_prebuffer_frames || queued_packets == 0) {
+          break;
+        }
+
+        if (!decode_next_packet()) {
+          break;
+        }
+      }
+
+      UINT32 queued_frames = 0;
+      std::size_t queued_packets = 0;
+      {
+        std::lock_guard lock(queue_mutex);
+        queued_frames = std::min<UINT32>(frames_available, static_cast<UINT32>(pending_frames.size()));
+        queued_packets = pending_packets.size();
+      }
+
+      const auto buffered_frames_total = padding + queued_frames;
+
+      if (!playout_started) {
+        if (buffered_frames_total < target_prebuffer_frames) {
+          if (!playout_wait_logged) {
+            playout_wait_logged = true;
+            BOOST_LOG(debug) << "Waiting for microphone playout prebuffer on [" << target_device_name << "], queued "
+                             << queued_frames << " frames, " << queued_packets << " buffered packets, padding " << padding << ", total buffered "
+                             << buffered_frames_total << " of " << target_prebuffer_frames << " target frames";
+          }
+          continue;
+        }
+
+        playout_started = true;
+        playout_wait_logged = false;
+        BOOST_LOG(debug) << "Microphone playout prebuffer ready on [" << target_device_name << "] with "
+                         << queued_frames << " queued frames, " << queued_packets << " buffered packets, padding " << padding
+                         << ", total buffered " << buffered_frames_total << " frames";
+      }
+
+      if (queued_frames == 0) {
+        while (decode_next_packet()) {
+          std::lock_guard lock(queue_mutex);
+          queued_frames = std::min<UINT32>(frames_available, static_cast<UINT32>(pending_frames.size()));
+          if (queued_frames != 0) {
+            break;
+          }
+        }
+      }
+
+      if (queued_frames == 0) {
+        continue;
       }
 
       BYTE *buffer = nullptr;
-      status = audio_render->GetBuffer(frames_to_write, &buffer);
+      status = audio_render->GetBuffer(queued_frames, &buffer);
       if (FAILED(status) || buffer == nullptr) {
-        if (FAILED(status) && recover_device(*this, status, "acquiring a microphone playback buffer")) {
-          return 0;
-        }
         BOOST_LOG(debug) << "Couldn't acquire microphone playback buffer for [" << target_device_name << "]: 0x"
                          << util::hex(status).to_string_view();
-        ::audio::mic_debug_on_render_error(sequence_number, "Could not acquire a microphone playback buffer from Windows");
-        return -1;
+        if (FAILED(status) && is_recoverable_device_error(status)) {
+          ::audio::mic_debug_on_backend_error("Steam microphone playback device was invalidated while acquiring a render buffer. Restart the stream.");
+          break;
+        }
+        continue;
       }
 
-      std::memcpy(buffer, output_pcm.data() + (frames_written * active_format.nChannels), frames_to_write * bytes_per_frame);
-      status = audio_render->ReleaseBuffer(frames_to_write, 0);
-      if (FAILED(status)) {
-        if (recover_device(*this, status, "releasing a microphone playback buffer")) {
-          return 0;
+      auto *dst = reinterpret_cast<float *>(buffer);
+      {
+        std::lock_guard lock(queue_mutex);
+        for (UINT32 frame = 0; frame < queued_frames; ++frame) {
+          const float sample = pending_frames.front();
+          pending_frames.pop_front();
+          dst[static_cast<std::size_t>(frame) * 2] = sample;
+          dst[static_cast<std::size_t>(frame) * 2 + 1] = sample;
         }
+      }
+
+      status = audio_render->ReleaseBuffer(queued_frames, 0);
+      if (FAILED(status)) {
         BOOST_LOG(debug) << "Couldn't release microphone playback buffer for [" << target_device_name << "]: 0x"
                          << util::hex(status).to_string_view();
-        ::audio::mic_debug_on_render_error(sequence_number, "Could not release a microphone playback buffer to Windows");
-        return -1;
+        if (is_recoverable_device_error(status)) {
+          ::audio::mic_debug_on_backend_error("Steam microphone playback device was invalidated while releasing a render buffer. Restart the stream.");
+          break;
+        }
       }
-
-      frames_written += frames_to_write;
-      empty_buffer_waits = 0;
     }
 
-    if (frames_written == 0) {
-      ::audio::mic_debug_on_render_error(sequence_number, "The microphone playback buffer stayed full long enough that this packet was skipped");
-      return 0;
-    }
-
-    if (frames_written < static_cast<UINT32>(decoded_frames)) {
-      BOOST_LOG(debug) << "Microphone playback buffer filled before the whole packet could be rendered for ["
-                       << target_device_name << "], wrote " << frames_written << " of " << decoded_frames << " frames";
-    }
-
-    if (!first_packet_written_logged) {
-      first_packet_written_logged = true;
-      BOOST_LOG(info) << "Client microphone audio is being rendered into [" << target_device_name << ']';
-    }
-
-    ::audio::mic_debug_on_packet_rendered(sequence_number, normalized_level, silent);
-
-    return decoded_frames;
+    CoUninitialize();
   }
 
   void mic_write_wasapi_t::cleanup() {
+    stop_render_thread = true;
+    if (render_event) {
+      SetEvent(render_event.get());
+    }
+
+    if (render_thread.joinable()) {
+      render_thread.join();
+    }
+
     if (audio_client) {
       audio_client->Stop();
     }
@@ -431,9 +947,21 @@ namespace platf::audio {
       opus_decoder = nullptr;
     }
 
+    active_format_storage.clear();
     buffer_frame_count = 0;
     active_format = {};
     target_device_name.clear();
     first_packet_written_logged = false;
+    render_event.reset();
+    {
+      std::lock_guard lock(queue_mutex);
+      pending_packets.clear();
+      pending_frames.clear();
+    }
+    expected_sequence_number = 0;
+    expected_timestamp = 0;
+    has_playout_cursor = false;
+    playout_started = false;
+    playout_wait_logged = false;
   }
 }  // namespace platf::audio
